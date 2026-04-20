@@ -8,6 +8,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import unquote
 
 from pydantic import BaseModel, Field
 
@@ -31,8 +32,39 @@ except ImportError as e:  # pragma: no cover - exercised when [web] not installe
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
-def resolve_session_token(*, browser: Optional[str], token_file: Optional[str]) -> tuple[str, str]:
+def _bundle_from_oauth_cookie_value(raw_value: str) -> dict[str, Any]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        raise SystemExit("oauth_cookie_value is empty")
+    try:
+        data = json.loads(unquote(raw))
+    except json.JSONDecodeError:
+        data = json.loads(raw)
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise SystemExit("oauth_cookie_value does not contain a valid access_token")
+    return data
+
+
+def resolve_session_token(
+    *,
+    browser: Optional[str],
+    token_file: Optional[str],
+    oauth_cookie_value: Optional[str] = None,
+) -> tuple[str, str]:
     from argparse import Namespace
+
+    if oauth_cookie_value:
+        try:
+            bundle = _bundle_from_oauth_cookie_value(oauth_cookie_value)
+            from wsprobe.credentials import SESSION_FILE, _persist_bundle
+
+            _persist_bundle(SESSION_FILE, bundle)
+            token = ensure_fresh_access_token(bundle, persist_path=SESSION_FILE)
+        except SystemExit as e:
+            raise HTTPException(status_code=401, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Credential resolution failed: {e}") from e
+        return token, "oauth-cookie"
 
     ns = Namespace(
         access_token=None,
@@ -45,6 +77,8 @@ def resolve_session_token(*, browser: Optional[str], token_file: Optional[str]) 
         token = ensure_fresh_access_token(bundle, persist_path=persist)
     except SystemExit as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Credential resolution failed: {e}") from e
     return token, src
 
 
@@ -78,6 +112,7 @@ class SessionBody(BaseModel):
         description="chrome, firefox, edge, … or omit to auto-detect",
     )
     token_file: Optional[str] = None
+    oauth_cookie_value: Optional[str] = None
 
 
 class PingBody(SessionBody):
@@ -128,7 +163,11 @@ def meta() -> dict[str, Any]:
 
 @app.post("/api/ping")
 def api_ping(body: PingBody) -> dict[str, Any]:
-    token, src = resolve_session_token(browser=body.browser, token_file=body.token_file)
+    token, src = resolve_session_token(
+        browser=body.browser,
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
     code, out, err = _capture_stdio(run_ping_with_token, token, _ns(json=True))
     payload: dict[str, Any] = {
         "credential_source": src,
@@ -146,7 +185,11 @@ def api_ping(body: PingBody) -> dict[str, Any]:
 
 @app.post("/api/security")
 def api_security(body: SecurityBody) -> dict[str, Any]:
-    token, src = resolve_session_token(browser=body.browser, token_file=body.token_file)
+    token, src = resolve_session_token(
+        browser=body.browser,
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
     args = _ns(
         security_id=body.security_id.strip(),
         json=True,
@@ -171,7 +214,11 @@ def api_security(body: SecurityBody) -> dict[str, Any]:
 
 @app.post("/api/restrictions")
 def api_restrictions(body: RestrictionsBody) -> dict[str, Any]:
-    token, src = resolve_session_token(browser=body.browser, token_file=body.token_file)
+    token, src = resolve_session_token(
+        browser=body.browser,
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
     side = body.side.upper()
     if side not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="side must be BUY or SELL")
@@ -200,7 +247,11 @@ def api_restrictions(body: RestrictionsBody) -> dict[str, Any]:
 
 @app.post("/api/preview-buy")
 def api_preview_buy(body: PreviewBuyBody) -> dict[str, Any]:
-    token, src = resolve_session_token(browser=body.browser, token_file=body.token_file)
+    token, src = resolve_session_token(
+        browser=body.browser,
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
     order = body.order.lower()
     if order not in ("market", "limit"):
         raise HTTPException(status_code=400, detail="order must be market or limit")
@@ -249,7 +300,11 @@ def api_wealthsimple_buy(body: WealthsimpleBuyBody) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Provide only one of: symbol, security_id")
     if not sym and not sec:
         raise HTTPException(status_code=400, detail="Provide symbol (e.g. VFV.TO) or security_id (sec-s-…)")
-    token, src = resolve_session_token(browser=body.browser, token_file=body.token_file)
+    token, src = resolve_session_token(
+        browser=body.browser,
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
     try:
         from wsprobe.trade_service import pick_account_id, place_market_buy as ws_buy, symbol_to_security_id
 
@@ -275,7 +330,11 @@ def api_wealthsimple_buy(body: WealthsimpleBuyBody) -> dict[str, Any]:
 
 @app.post("/api/trade-accounts")
 def api_trade_accounts(body: PingBody) -> dict[str, Any]:
-    token, src = resolve_session_token(browser=body.browser, token_file=body.token_file)
+    token, src = resolve_session_token(
+        browser=body.browser,
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
     try:
         from wsprobe.trade_service import list_accounts
 

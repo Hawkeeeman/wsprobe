@@ -5,6 +5,7 @@ import os
 import sys
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import unquote
+from pathlib import Path
 
 
 def _parse_oauth2_cookie_value(raw: str) -> Optional[dict[str, Any]]:
@@ -46,13 +47,43 @@ def _oauth_access_token_from_jar(jar: object) -> Optional[str]:
 def _loaders() -> dict[str, Callable[[], object]]:
     import browser_cookie3 as bc3
 
+    def _with_cookie_candidates(
+        loader: Callable[..., object],
+        candidates: list[Path],
+    ) -> Callable[[], object]:
+        def _load() -> object:
+            last_exc: Exception | None = None
+            for path in candidates:
+                if not path.is_file():
+                    continue
+                try:
+                    return loader(cookie_file=str(path))
+                except Exception as e:
+                    last_exc = e
+            if last_exc is not None:
+                raise last_exc
+            return loader()
+
+        return _load
+
+    opera_candidates = [
+        Path.home() / "Library/Application Support/com.operasoftware.Opera/Cookies",
+        Path.home() / "Library/Application Support/com.operasoftware.Opera/Default/Cookies",
+        Path.home() / "Library/Application Support/com.operasoftware.Opera/Default/Network/Cookies",
+    ]
+    opera_gx_candidates = [
+        Path.home() / "Library/Application Support/com.operasoftware.OperaGX/Cookies",
+        Path.home() / "Library/Application Support/com.operasoftware.OperaGX/Default/Cookies",
+        Path.home() / "Library/Application Support/com.operasoftware.OperaGX/Default/Network/Cookies",
+    ]
+
     return {
         "chrome": bc3.chrome,
         "chromium": bc3.chromium,
         "edge": bc3.edge,
         "firefox": bc3.firefox,
-        "opera": bc3.opera,
-        "opera_gx": bc3.opera_gx,
+        "opera": _with_cookie_candidates(bc3.opera, opera_candidates),
+        "opera_gx": _with_cookie_candidates(bc3.opera_gx, opera_gx_candidates),
         "brave": bc3.brave,
         "safari": bc3.safari,
         "vivaldi": bc3.vivaldi,

@@ -36,6 +36,35 @@ query FetchSecurity($securityId: ID!, $currency: Currency) {
 }
 """
 
+FETCH_SECURITY_QUOTES = """
+query FetchIntraDayChartQuotes(
+  $id: ID!
+  $date: Date
+  $tradingSession: TradingSession
+  $currency: Currency
+  $period: ChartPeriod
+) {
+  security(id: $id) {
+    id
+    chartBarQuotes(
+      date: $date
+      tradingSession: $tradingSession
+      currency: $currency
+      period: $period
+    ) {
+      securityId
+      price
+      sessionPrice
+      timestamp
+      currency
+      marketStatus
+      __typename
+    }
+    __typename
+  }
+}
+"""
+
 FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS = """
 query FetchSoOrdersLimitOrderRestrictions($args: SoOrders_LimitOrderRestrictionsArgs!) {
   soOrdersLimitOrderRestrictions(args: $args) {
