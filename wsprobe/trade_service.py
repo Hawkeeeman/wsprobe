@@ -25,6 +25,13 @@ def _request(
         "accept": "application/json",
         "authorization": f"Bearer {access_token}",
         "content-type": "application/json",
+        "origin": "https://my.wealthsimple.com",
+        "referer": "https://my.wealthsimple.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
     }
     data: Optional[bytes] = None
     if json_body is not None:
@@ -41,7 +48,10 @@ def _request(
         try:
             return status, json.loads(text)
         except json.JSONDecodeError:
-            return status, {"_raw": text}
+            preview = " ".join(text.split())
+            if len(preview) > 320:
+                preview = preview[:320] + "..."
+            return status, {"_raw_preview": preview}
 
     try:
         return status, json.loads(text) if text.strip() else {}

@@ -16,6 +16,7 @@ from wsprobe.credentials import (
 from wsprobe.queries import (
     FETCH_IDENTITY_PACKAGES,
     FETCH_SECURITY,
+    FETCH_SECURITY_QUOTES,
     FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS,
 )
 
@@ -63,7 +64,8 @@ def _graphql_query_with_auth_retry(
     query: str,
     variables: dict[str, Any],
 ) -> tuple[int, dict[str, Any] | None, str | None]:
-    token = resolve_access_token(args)
+    injected_token = getattr(args, "access_token", None)
+    token = str(injected_token) if injected_token else resolve_access_token(args)
     status, payload, raw = graphql_request(
         access_token=token,
         operation_name=operation_name,
@@ -98,9 +100,15 @@ def cmd_security(args: argparse.Namespace) -> int:
     sid = args.security_id.strip()
     status, payload, raw = _graphql_query_with_auth_retry(
         args,
-        operation_name="FetchSecurity",
-        query=FETCH_SECURITY,
-        variables={"securityId": sid, "currency": None},
+        operation_name="FetchIntraDayChartQuotes",
+        query=FETCH_SECURITY_QUOTES,
+        variables={
+            "id": sid,
+            "date": None,
+            "tradingSession": "OVERNIGHT",
+            "currency": None,
+            "period": "ONE_DAY",
+        },
     )
     if raw:
         print(raw, file=sys.stderr)

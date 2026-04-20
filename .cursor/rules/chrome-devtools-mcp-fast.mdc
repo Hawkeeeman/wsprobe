@@ -1,0 +1,34 @@
+---
+description: Faster Chrome DevTools MCP — fewer round trips, batch when possible
+alwaysApply: true
+---
+
+# Chrome DevTools MCP (speed)
+
+When driving the browser via **user-chrome-devtools** MCP:
+
+## Skip redundant context
+- Do **not** call `list_pages` unless the active tab is unknown or the user switched sites. If the last `list_pages` showed the target as `[selected]`, **skip** `select_page`.
+- Do **not** call `select_page` if the correct page is already selected.
+
+## Snapshots
+- Prefer **`click` with `includeSnapshot: true`** instead of `click` + separate `take_snapshot`.
+- Call **`take_snapshot`** only when: uids are unknown, the page likely re-rendered, navigation occurred, or the last action failed. Avoid snapshot-before-every-click on a stable screen.
+
+## Prefer one shot over many clicks
+- For multi-step UI (open search → type → submit), use **`evaluate_script`** with a single async function when the DOM is stable and selectors are reliable.
+- If the app has a global shortcut (e.g. ⌘K / Ctrl+K for search), prefer **`press_key`** after confirming it works — fewer snapshots than hunting uids.
+
+## Navigation
+- If the goal URL is known, use **`navigate_page`** instead of clicking through the nav.
+
+## Ordering
+- Never parallelize **click** / **fill** / **navigate** that depend on prior DOM state. Parallelize only independent read-only calls if needed.
+
+## Reporting
+- Briefly state what was skipped (e.g. “skipped list_pages; tab already selected”) so the user sees the optimization.
+
+## Network / auth inspection
+- Use **`list_network_requests`** with **`resourceTypes`: `fetch` + `xhr`** and **`includePreservedRequests`: true** to retain traffic across navigations.
+- For auth research, summarize **hosts, paths, methods, status codes, and header *names*** (e.g. `Authorization`, `x-ws-*`). **Do not paste** `Authorization`, `Cookie`, refresh tokens, or full GraphQL bodies in chat — transcripts persist.
+- Call **`get_network_request`** only when detail is needed; treat responses as sensitive by default.

@@ -1,0 +1,8 @@
+---
+description: Trading repo — wsprobe, Wealthsimple read-only + preview flows
+alwaysApply: true
+---
+
+# Trading workspace
+
+Primary Python package is **`wsprobe/`** (CLI: `python3 -m wsprobe`): read-only Wealthsimple GraphQL + preview-buy; GraphQL mutations stay blocked. **Real buys** use Wealthsimple Trade REST (`trade-service.wealthsimple.com`, `wsprobe buy --account-id … --security-id … --shares N --confirm`). SnapTrade remains optional (`snaptrade-buy`, `docs/README_SNAPTRADE.md`). GraphQL mutations stay blocked in `client.py`. Optional local UI: `pip install -e '.[web]'` then `wsprobe-serve`. The repo also contains bots, SnapTrade/Alpaca scripts, and sim code — prefer the smallest change that matches the user’s request.

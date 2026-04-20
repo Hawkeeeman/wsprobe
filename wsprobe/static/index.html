@@ -113,8 +113,11 @@
         <option value="firefox">Firefox</option>
         <option value="brave">Brave</option>
         <option value="opera">Opera</option>
+        <option value="opera_gx">Opera GX</option>
         <option value="safari">Safari</option>
       </select>
+      <label for="token-file">Token file path (optional, bypass browser cookies)</label>
+      <input id="token-file" type="text" placeholder="e.g. /Users/you/.config/wsprobe/config.json" autocomplete="off" />
     </section>
 
     <section>
@@ -217,8 +220,10 @@
   <script>
     function sessionBody() {
       const b = document.getElementById("browser").value;
+      const t = document.getElementById("token-file").value.trim();
       const o = {};
       if (b) o.browser = b;
+      if (t) o.token_file = t;
       return o;
     }
     async function post(path, body) {
@@ -231,7 +236,13 @@
       let data;
       try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
       if (!r.ok) {
-        const err = new Error(data.detail ? JSON.stringify(data.detail) : text);
+        let msg = "Request failed (see details below)";
+        if (typeof data.detail === "string" && data.detail.trim()) {
+          msg = data.detail;
+        } else if (!data.detail && typeof text === "string" && text.trim()) {
+          msg = text;
+        }
+        const err = new Error(msg);
         err.payload = data;
         throw err;
       }
@@ -245,9 +256,14 @@
       st.textContent = msg;
       st.className = "status " + (ok ? "ok" : "bad");
     }
+    function showInputError(preId, stId, msg) {
+      show(preId, stId, false, msg, { detail: msg });
+    }
     document.getElementById("btn-ping").onclick = async () => {
       const b = document.getElementById("btn-ping");
+      const oldLabel = b.textContent;
       b.disabled = true;
+      b.textContent = "Running...";
       try {
         const data = await post("/api/ping", {});
         show("out-ping", "st-ping", true, "OK — session: " + data.credential_source, data);
@@ -255,12 +271,15 @@
         show("out-ping", "st-ping", false, e.message, e.payload || e.message);
       }
       b.disabled = false;
+      b.textContent = oldLabel;
     };
     document.getElementById("btn-security").onclick = async () => {
       const id = document.getElementById("sec-id").value.trim();
-      if (!id) { alert("Enter a security id"); return; }
+      if (!id) { showInputError("out-security", "st-security", "Enter a security id"); return; }
       const b = document.getElementById("btn-security");
+      const oldLabel = b.textContent;
       b.disabled = true;
+      b.textContent = "Fetching...";
       try {
         const data = await post("/api/security", { security_id: id });
         show("out-security", "st-security", true, "OK — " + data.credential_source, data);
@@ -268,12 +287,15 @@
         show("out-security", "st-security", false, e.message, e.payload || e.message);
       }
       b.disabled = false;
+      b.textContent = oldLabel;
     };
     document.getElementById("btn-rest").onclick = async () => {
       const id = document.getElementById("rest-sec").value.trim();
-      if (!id) { alert("Enter a security id"); return; }
+      if (!id) { showInputError("out-rest", "st-rest", "Enter a security id"); return; }
       const b = document.getElementById("btn-rest");
+      const oldLabel = b.textContent;
       b.disabled = true;
+      b.textContent = "Fetching...";
       try {
         const data = await post("/api/restrictions", {
           security_id: id,
@@ -284,6 +306,7 @@
         show("out-rest", "st-rest", false, e.message, e.payload || e.message);
       }
       b.disabled = false;
+      b.textContent = oldLabel;
     };
     document.getElementById("btn-preview").onclick = async () => {
       const security_id = document.getElementById("pb-sec").value.trim();
@@ -291,13 +314,15 @@
       const order = document.getElementById("pb-order").value;
       const limitRaw = document.getElementById("pb-limit").value;
       const assumeRaw = document.getElementById("pb-assume").value;
-      if (!security_id) { alert("Enter a security id"); return; }
-      if (!(shares > 0)) { alert("Enter a positive share count"); return; }
+      if (!security_id) { showInputError("out-preview", "st-preview", "Enter a security id"); return; }
+      if (!(shares > 0)) { showInputError("out-preview", "st-preview", "Enter a positive share count"); return; }
       const body = { security_id, shares, order };
       if (order === "limit" && limitRaw) body.limit_price = parseFloat(limitRaw);
       if (assumeRaw) body.assume_price = parseFloat(assumeRaw);
       const b = document.getElementById("btn-preview");
+      const oldLabel = b.textContent;
       b.disabled = true;
+      b.textContent = "Previewing...";
       try {
         const data = await post("/api/preview-buy", body);
         show("out-preview", "st-preview", true, "Preview only — " + data.credential_source, data);
@@ -305,10 +330,13 @@
         show("out-preview", "st-preview", false, e.message, e.payload || e.message);
       }
       b.disabled = false;
+      b.textContent = oldLabel;
     };
     document.getElementById("btn-taccounts").onclick = async () => {
       const b = document.getElementById("btn-taccounts");
+      const oldLabel = b.textContent;
       b.disabled = true;
+      b.textContent = "Loading...";
       try {
         const data = await post("/api/trade-accounts", {});
         show("out-buy", "st-buy", true, "Trade accounts — copy an id into Account id", data);
@@ -316,23 +344,26 @@
         show("out-buy", "st-buy", false, e.message, e.payload || e.message);
       }
       b.disabled = false;
+      b.textContent = oldLabel;
     };
     document.getElementById("btn-buy").onclick = async () => {
       if (!document.getElementById("buy-confirm").checked) {
-        alert("Check the confirmation box first.");
+        showInputError("out-buy", "st-buy", "Check the confirmation box first.");
         return;
       }
       const raw = document.getElementById("buy-ticker").value.trim();
       const acct = document.getElementById("buy-acct").value.trim();
       const shares = parseFloat(document.getElementById("buy-units").value);
-      if (!raw) { alert("Enter a ticker (e.g. VFV.TO) or sec-s-… id"); return; }
-      if (!(shares > 0)) { alert("Enter a positive share count"); return; }
+      if (!raw) { showInputError("out-buy", "st-buy", "Enter a ticker (e.g. VFV.TO) or sec-s-… id"); return; }
+      if (!(shares > 0)) { showInputError("out-buy", "st-buy", "Enter a positive share count"); return; }
       const body = { shares, confirm: true };
       if (acct) body.account_id = acct;
       if (raw.toLowerCase().startsWith("sec-s-")) body.security_id = raw;
       else body.symbol = raw;
       const b = document.getElementById("btn-buy");
+      const oldLabel = b.textContent;
       b.disabled = true;
+      b.textContent = "Submitting...";
       try {
         const data = await post("/api/buy", body);
         show("out-buy", "st-buy", true, "Order submitted (Wealthsimple Trade)", data);
@@ -340,6 +371,7 @@
         show("out-buy", "st-buy", false, e.message, e.payload || e.message);
       }
       b.disabled = false;
+      b.textContent = oldLabel;
     };
   </script>
 </body>

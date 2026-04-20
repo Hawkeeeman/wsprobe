@@ -89,7 +89,10 @@ def refresh_access_token(
         try:
             err_body = json.loads(text)
         except json.JSONDecodeError:
-            err_body = {"_raw": text}
+            preview = " ".join(text.split())
+            if len(preview) > 320:
+                preview = preview[:320] + "..."
+            err_body = {"_raw_preview": preview}
         raise RuntimeError(
             f"OAuth refresh failed HTTP {status}: {err_body}"
         ) from None

@@ -49,6 +49,13 @@ def graphql_request(
         "accept": "*/*",
         "content-type": "application/json",
         "authorization": f"Bearer {access_token}",
+        "origin": "https://my.wealthsimple.com",
+        "referer": "https://my.wealthsimple.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
         "x-ws-api-version": DEFAULT_API_VERSION,
         "x-ws-profile": profile,
         "x-ws-operation-name": operation_name,
