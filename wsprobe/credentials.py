@@ -46,8 +46,12 @@ def _persist_bundle(path: Path, bundle: dict[str, Any]) -> None:
         except json.JSONDecodeError:
             pass
     for key in ("access_token", "refresh_token", "client_id"):
-        if key in bundle and bundle[key]:
+        if key not in bundle:
+            continue
+        if bundle[key]:
             existing[key] = bundle[key]
+        else:
+            existing.pop(key, None)
     path.write_text(json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8")
 
 

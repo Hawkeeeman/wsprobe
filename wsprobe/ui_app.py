@@ -13,13 +13,9 @@ from urllib.parse import unquote
 from pydantic import BaseModel, Field
 
 from wsprobe import __version__
-from wsprobe.cli import (
-    cmd_preview_buy,
-    cmd_restrictions,
-    cmd_security,
-    run_ping_with_token,
-)
-from wsprobe.credentials import CONFIG_FILE, ensure_fresh_access_token, load_oauth_bundle
+from wsprobe.browser_cookies import oauth2_bundle_first_available, oauth2_bundle_from_browser
+from wsprobe.cli import cmd_preview_buy, cmd_restrictions, cmd_security, run_ping_with_token
+from wsprobe.credentials import CONFIG_FILE, SESSION_FILE, _persist_bundle, ensure_fresh_access_token, load_oauth_bundle
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -56,8 +52,6 @@ def resolve_session_token(
     if oauth_cookie_value:
         try:
             bundle = _bundle_from_oauth_cookie_value(oauth_cookie_value)
-            from wsprobe.credentials import SESSION_FILE, _persist_bundle
-
             _persist_bundle(SESSION_FILE, bundle)
             token = ensure_fresh_access_token(bundle, persist_path=SESSION_FILE)
         except SystemExit as e:
@@ -66,15 +60,35 @@ def resolve_session_token(
             raise HTTPException(status_code=502, detail=f"Credential resolution failed: {e}") from e
         return token, "oauth-cookie"
 
-    ns = Namespace(
-        access_token=None,
-        cookies_browser=browser,
-        token_file=token_file,
-        command="easy",
-    )
+    if token_file:
+        ns = Namespace(
+            access_token=None,
+            cookies_browser=None,
+            token_file=token_file,
+            command="ping",
+        )
+        try:
+            bundle, persist, src = load_oauth_bundle(ns)
+            token = ensure_fresh_access_token(bundle, persist_path=persist)
+        except SystemExit as e:
+            raise HTTPException(status_code=401, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Credential resolution failed: {e}") from e
+        return token, src
+
     try:
-        bundle, persist, src = load_oauth_bundle(ns)
-        token = ensure_fresh_access_token(bundle, persist_path=persist)
+        if browser:
+            b = browser.strip()
+            bundle = oauth2_bundle_from_browser(b)
+            src = f"browser:{b}"
+        else:
+            bundle, detected = oauth2_bundle_first_available()
+            src = f"browser:{detected}"
+        if "refresh_token" not in bundle:
+            bundle = dict(bundle)
+            bundle["refresh_token"] = ""
+        _persist_bundle(SESSION_FILE, bundle)
+        token = ensure_fresh_access_token(bundle, persist_path=SESSION_FILE)
     except SystemExit as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
     except Exception as e:
