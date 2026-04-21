@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -53,7 +50,13 @@ def run_ping_with_token(
 ) -> int:
     sub = identity_id_for_graphql(token, oauth_bundle)
     if not sub:
-        raise SystemExit("Could not read identity id from token")
+        # Check if token looks like a valid JWT (3 parts, starts with eyJ which is {" base64 encoded)
+        if not token or len(token.split(".")) != 3 or not token.startswith("eyJ"):
+            raise SystemExit(
+                "Invalid or test token detected. "
+                "Please log in at https://my.wealthsimple.com, then run wsprobe again."
+            )
+        raise SystemExit("Could not read identity id from token (token may be expired or malformed)")
 
     status, payload, raw = graphql_request(
         access_token=token,
@@ -204,8 +207,8 @@ def cmd_import_session(args: argparse.Namespace) -> int:
 
 def cmd_preview_buy(args: argparse.Namespace) -> int:
     """
-    Buy-intent preview: read-only GraphQL only. Never submits or finalizes an order
-    (mutations are blocked in the HTTP client).
+    Read-only buy preflight using GraphQL queries only.
+    Never submits, confirms, or finalizes an order.
     """
     sid = args.security_id.strip()
     shares = float(args.shares)
@@ -258,51 +261,86 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
     }
 
     if args.json:
+        ok_security = st_a == 200 and not err_a
+        ok_restrictions = st_b == 200 and not err_b
+        ready = bool(ok_security and ok_restrictions)
         out = {
             "preview_only": True,
             "no_submit": True,
+            "checked": {
+                "security_quote_lookup": True,
+                "buy_side_limit_restrictions": True,
+            },
+            "result": {
+                "security_ok": ok_security,
+                "restrictions_ok": ok_restrictions,
+                "ready_for_real_buy_command": ready,
+            },
             "http": {"security": st_a, "restrictions": st_b},
             "graphql": {"security": pl_a, "restrictions": pl_b},
             "intent": intent,
         }
         print(format_json(out))
-        return 0 if st_a == 200 and st_b == 200 and not err_a and not err_b else 1
+        return 0 if ready else 1
 
-    print("=" * 64, file=sys.stderr)
-    print(" PREVIEW ONLY — no order submitted or finalized", file=sys.stderr)
-    print(" (wsprobe only sends GraphQL queries; mutations are blocked)", file=sys.stderr)
-    print("=" * 64, file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
+    print(" PREVIEW MODE ONLY (READ-ONLY)", file=sys.stderr)
+    print(" This command does NOT place a trade.", file=sys.stderr)
+    print(" It only runs two GraphQL queries:", file=sys.stderr)
+    print("   1) security + quote lookup", file=sys.stderr)
+    print("   2) BUY-side limit-order restrictions lookup", file=sys.stderr)
+    print("=" * 68, file=sys.stderr)
     print()
-    print("Intent")
-    print(f"  Side:        BUY")
-    print(f"  Order type:  {order.upper()}" + (f" @ {limit_px:g}" if order == "limit" and limit_px else ""))
-    print(f"  Shares:      {shares:g}")
-    print(f"  Security id: {sid}")
+    print("Requested intent")
+    print(f"  Side:            BUY")
+    print(f"  Order type:      {order.upper()}" + (f" @ {limit_px:g}" if order == "limit" and limit_px else ""))
+    print(f"  Shares:          {shares:g}")
+    print(f"  Security id:     {sid}")
     if sym:
-        print(f"  Symbol:      {sym}")
+        print(f"  Symbol:          {sym}")
     if assume is not None:
         approx = assume * shares
         print()
-        print("Rough notional (your --assume-price × shares; informational only)")
+        print("Rough notional (from your --assume-price; informational only)")
         print(f"  ~ ${approx:,.2f}  (assumed ${assume:g} × {shares:g} sh)")
 
     print()
-    print("Eligibility / security (API)")
+    print("Check 1/2: security + quote")
+    print(f"  HTTP status:     {st_a}")
+    if err_a:
+        print("  GraphQL errors:  yes")
+    else:
+        print("  GraphQL errors:  no")
     if sec:
+        buyable = sec.get("buyable") if isinstance(sec, dict) else None
+        eligible = sec.get("wsTradeEligible")
+        if eligible is None and isinstance(sec, dict):
+            eligible = sec.get("ws_trade_eligible")
+        if buyable is not None:
+            print(f"  buyable:         {buyable}")
+        if eligible is not None:
+            print(f"  ws_trade_eligible: {eligible}")
+        print("  Raw payload:")
         print(format_json(sec))
     else:
-        print("(no security data)")
+        print("  (no security data)")
 
     print()
-    print("Limit-order restrictions (API)")
+    print("Check 2/2: BUY-side limit-order restrictions")
+    print(f"  HTTP status:     {st_b}")
+    if err_b:
+        print("  GraphQL errors:  yes")
+    else:
+        print("  GraphQL errors:  no")
     if rest:
+        print("  Raw payload:")
         print(format_json(rest))
     else:
-        print("(no restrictions data)")
+        print("  (no restrictions data)")
 
     if err_a or err_b:
         print()
-        print("GraphQL errors:", file=sys.stderr)
+        print("Preview failed: GraphQL errors detected.", file=sys.stderr)
         if err_a:
             print(format_json(err_a), file=sys.stderr)
         if err_b:
@@ -310,7 +348,9 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
         return 1
 
     print()
-    print("Place any real trade in the official Wealthsimple app or website.", file=sys.stderr)
+    print("Preview complete: checks ran successfully.", file=sys.stderr)
+    print("No order was submitted.", file=sys.stderr)
+    print("To place a real order: wsprobe buy --symbol <TICKER> --shares <N> --confirm", file=sys.stderr)
     return 0
 
 
@@ -361,37 +401,6 @@ def cmd_buy(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_snaptrade_buy(args: argparse.Namespace) -> int:
-    """Market buy via SnapTrade (optional; separate from direct Wealthsimple session)."""
-    if not getattr(args, "confirm", False):
-        print(
-            "Places a REAL market BUY via SnapTrade. Needs: pip install 'wsprobe[trade]' and SNAPTRADE_* env.\n"
-            "Example: wsprobe snaptrade-buy HOD.TO 2 --confirm\n",
-            file=sys.stderr,
-        )
-        return 1
-    try:
-        from wsprobe.snaptrade_buy import format_order_result, place_market_buy
-
-        out = place_market_buy(
-            args.symbol,
-            float(args.units),
-            account_id=getattr(args, "account_id", None),
-        )
-    except ImportError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if args.json:
-        print(format_json({"ok": True, "order": out}))
-    else:
-        print("Order submitted (SnapTrade). Response:", file=sys.stderr)
-        print(format_order_result(out))
-    return 0
-
-
 def cmd_export_session_snippet(args: argparse.Namespace) -> int:
     """Print JS for pasting into DevTools on my.wealthsimple.com to build session.json."""
     print(
@@ -406,29 +415,6 @@ def cmd_export_session_snippet(args: argparse.Namespace) -> int:
         path = minp if minp.is_file() else base / "export_session_console.js"
     sys.stdout.write(path.read_text(encoding="utf-8"))
     return 0
-
-
-def cmd_bird(args: argparse.Namespace) -> int:
-    """
-    Run @steipete/bird (X/Twitter cookie + GraphQL) via npx. Separate from Wealthsimple auth.
-    """
-    npx = shutil.which("npx")
-    if not npx:
-        raise SystemExit(
-            "bird: need Node.js npx on PATH (install Node, then retry).\n"
-            "This subcommand does not use Wealthsimple cookies."
-        )
-    pkg = os.environ.get("WSPROBE_BIRD_PACKAGE", "@steipete/bird").strip() or "@steipete/bird"
-    rest = list(args.bird_argv)
-    if rest and rest[0] == "--":
-        rest = rest[1:]
-    if not rest:
-        rest = ["check"]
-    cmd = [npx, "-y", pkg, *rest]
-    try:
-        return subprocess.call(cmd)
-    except OSError as e:
-        raise SystemExit(f"bird: failed to run {cmd[0]}: {e}") from e
 
 
 def cmd_trade_accounts(args: argparse.Namespace) -> int:
@@ -482,8 +468,6 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s preview-buy sec-s-… --shares 1 --order market --assume-price 264\n"
             "  %(prog)s trade-accounts            list account ids (Trade REST)\n"
             "  %(prog)s buy --symbol VFV.TO --shares 1 --confirm   market buy (easiest; one account)\n"
-            "  %(prog)s snaptrade-buy HOD.TO 1 --confirm   buy via SnapTrade (optional)\n"
-            "  %(prog)s bird check                 X/Twitter session via @steipete/bird (npx; not Wealthsimple)\n"
             "  %(prog)s export-session-snippet     print JS: paste on my.wealthsimple.com → session.json\n"
             "  %(prog)s session-path               print where session.json lives (~/.config/wsprobe/)\n"
             "  %(prog)s import-session tokens.json   save tokens to session.json (or stdin)\n"
@@ -557,7 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "preview-buy",
-        help="Buy-intent preview (queries only; does not submit or finalize an order)",
+        help="Read-only buy preflight (queries only; never submits an order)",
     )
     sp.add_argument("security_id", help="Wealthsimple security id, e.g. sec-s-…")
     sp.add_argument(
@@ -677,50 +661,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required: acknowledge this submits a real order",
     )
     sp.set_defaults(func=cmd_buy)
-
-    sp = sub.add_parser(
-        "snaptrade-buy",
-        help="REAL market buy via SnapTrade (optional; needs pip install wsprobe[trade])",
-    )
-    sp.add_argument("symbol", help='Ticker, e.g. NVDA or HOD.TO')
-    sp.add_argument(
-        "units",
-        nargs="?",
-        type=float,
-        default=1.0,
-        help="Number of shares/units (default: 1)",
-    )
-    sp.add_argument(
-        "--confirm",
-        action="store_true",
-        help="Required: acknowledge this submits a real order via SnapTrade",
-    )
-    sp.add_argument(
-        "--account-id",
-        default=None,
-        metavar="ID",
-        help="SnapTrade account id (default: SNAPTRADE_ACCOUNT_ID or first linked account)",
-    )
-    sp.set_defaults(func=cmd_snaptrade_buy)
-
-    sp = sub.add_parser(
-        "bird",
-        help="Run @steipete/bird (X cookie GraphQL) via npx — separate from Wealthsimple OAuth",
-        description=(
-            "Delegates to the npm package @steipete/bird (requires Node.js npx). "
-            "Uses X/Twitter auth_token + ct0 cookies, not Wealthsimple. "
-            "Default subcommand when omitted: check. "
-            "Override package with env WSPROBE_BIRD_PACKAGE (default: @steipete/bird)."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    sp.add_argument(
-        "bird_argv",
-        nargs="*",
-        metavar="ARG",
-        help="Passed to bird (e.g. check, whoami, read <url>). Use -- before flags if needed.",
-    )
-    sp.set_defaults(func=cmd_bird)
 
     sp = sub.add_parser(
         "export-session-snippet",

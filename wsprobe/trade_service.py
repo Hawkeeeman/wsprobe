@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import ssl
+import time
 import urllib.error
 import urllib.request
 from typing import Any, List, Optional, Tuple
 from urllib.parse import quote
 
 TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com"
+_TRANSIENT_ORDER_STATUSES = {"", "new", "pending", "queued", "accepted", "open", "submitted", "in_progress"}
 
 
 def _request(
@@ -145,12 +147,60 @@ def _is_crypto(security: dict[str, Any]) -> bool:
     return False
 
 
+def _order_id(order: dict[str, Any]) -> str:
+    oid = order.get("order_id") or order.get("id")
+    if not oid:
+        raise RuntimeError(f"Order response missing order_id/id: {order}")
+    return str(oid)
+
+
+def get_order(access_token: str, order_id: str) -> dict[str, Any]:
+    status, body = _request("GET", "/orders", access_token=access_token)
+    if status != 200:
+        raise RuntimeError(f"orders HTTP {status}: {body}")
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Unexpected orders response: {body}")
+    results = body.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError(f"orders missing results: {body}")
+    needle = order_id.strip()
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("order_id") or row.get("id")
+        if rid and str(rid) == needle:
+            return row
+    raise RuntimeError(f"Order {needle} not found in /orders response")
+
+
+def wait_for_order_finalization(
+    access_token: str,
+    order_id: str,
+    *,
+    timeout_s: float = 30.0,
+    poll_interval_s: float = 1.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(timeout_s, 0.1)
+    last_seen: dict[str, Any] | None = None
+    while True:
+        row = get_order(access_token, order_id)
+        last_seen = row
+        status = str(row.get("status") or "").strip().lower()
+        if status not in _TRANSIENT_ORDER_STATUSES:
+            return row
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(poll_interval_s, 0.1))
+    raise RuntimeError(f"Order {order_id} did not finalize within {timeout_s:g}s (last status: {last_seen})")
+
+
 def place_market_buy(
     access_token: str,
     *,
     account_id: str,
     security_id: str,
     quantity: float,
+    finalize_timeout_s: float = 30.0,
 ) -> dict[str, Any]:
     """
     POST /orders — market buy (same field names as wstrade-api / MarkGalloway API.md).
@@ -189,4 +239,8 @@ def place_market_buy(
         raise RuntimeError(f"orders HTTP {status}: {resp}")
     if not isinstance(resp, dict):
         raise RuntimeError(f"Unexpected order response: {resp}")
-    return resp
+    return wait_for_order_finalization(
+        access_token,
+        _order_id(resp),
+        timeout_s=finalize_timeout_s,
+    )
