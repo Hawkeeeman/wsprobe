@@ -126,11 +126,20 @@ def ensure_fresh_access_token(
     return str(new_access)
 
 
+def _browser_bundle_persisted(bundle: dict[str, Any], source_label: str) -> tuple[dict[str, Any], Path, str]:
+    """Merge empty refresh to drop stale file keys, persist, return (bundle, persist_path, label)."""
+    if "refresh_token" not in bundle:
+        bundle = dict(bundle)
+        bundle["refresh_token"] = ""
+    _persist_bundle(SESSION_FILE, bundle)
+    return bundle, SESSION_FILE, source_label
+
+
 def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str]:
     """
-    Same resolution order as legacy _load_token, but returns full OAuth cookie/file dict
-    when available. Second value is path to persist refreshed tokens (config or --token-file).
-    Third is a short label for logging/UI (e.g. browser:chrome, env).
+    Returns OAuth dict, path to persist refreshed tokens (if any), and a short source label.
+    Order matches wsprobe-serve: prefer live browser cookies over stale on-disk session so CLI
+    and local UI use the same resolution.
     """
     injected = getattr(args, "access_token", None)
     if injected:
@@ -149,21 +158,20 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
             d["client_id"] = cid
         return d, None, "injected"
 
-    browser = getattr(args, "cookies_browser", None)
-    if browser:
-        from wsprobe.browser_cookies import oauth2_bundle_from_browser
-
-        b = str(browser).strip()
-        bundle = oauth2_bundle_from_browser(b)
-        _persist_bundle(SESSION_FILE, bundle)
-        return bundle, SESSION_FILE, f"browser:{b}"
-
     if getattr(args, "token_file", None):
         p = Path(args.token_file).expanduser()
         data = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not data.get("access_token"):
             raise SystemExit(f"No access_token in {p}")
         return data, p, f"file:{p}"
+
+    browser = getattr(args, "cookies_browser", None)
+    if browser:
+        from wsprobe.browser_cookies import oauth2_bundle_from_browser
+
+        b = str(browser).strip()
+        br = oauth2_bundle_from_browser(b)
+        return _browser_bundle_persisted(br, f"browser:{b}")
 
     oauth_json = os.environ.get("WEALTHSIMPLE_OAUTH_JSON", "").strip()
     if oauth_json:
@@ -186,6 +194,16 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
             d["client_id"] = cid
         return d, None, "env"
 
+    from wsprobe.browser_cookies import oauth2_bundle_first_available
+
+    try:
+        br, name = oauth2_bundle_first_available()
+    except SystemExit:
+        br = None
+        name = ""
+    if br and br.get("access_token"):
+        return _browser_bundle_persisted(br, f"browser:{name}")
+
     if CONFIG_FILE.is_file():
         data = _load_bundle_from_file(CONFIG_FILE)
         if data:
@@ -194,14 +212,6 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
     session = _load_bundle_from_file(SESSION_FILE)
     if session:
         return session, SESSION_FILE, f"session:{SESSION_FILE}"
-
-    cmd = getattr(args, "command", None)
-    if cmd in ("easy", None):
-        from wsprobe.browser_cookies import oauth2_bundle_first_available
-
-        bundle, name = oauth2_bundle_first_available()
-        _persist_bundle(SESSION_FILE, bundle)
-        return bundle, SESSION_FILE, f"browser:{name}"
 
     raise SystemExit(
         "No credentials. Easiest:\n"
