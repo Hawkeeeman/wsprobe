@@ -10,10 +10,17 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from wsprobe import __version__
-from wsprobe.cli import cmd_preview_buy, cmd_restrictions, cmd_security, run_ping_with_token
+from wsprobe.cli import (
+    cmd_doctor,
+    cmd_lookup,
+    cmd_preview_buy,
+    cmd_restrictions,
+    cmd_security,
+    run_ping_with_token,
+)
 from wsprobe.credentials import SESSION_FILE, _persist_bundle, ensure_fresh_access_token, load_oauth_bundle
 
 try:
@@ -42,7 +49,6 @@ def _bundle_from_oauth_cookie_value(raw_value: str) -> dict[str, Any]:
 
 def resolve_session_token(
     *,
-    browser: Optional[str],
     token_file: Optional[str],
     oauth_cookie_value: Optional[str] = None,
 ) -> tuple[str, str]:
@@ -61,9 +67,7 @@ def resolve_session_token(
 
     ns = Namespace(
         access_token=None,
-        cookies_browser=None
-        if (token_file and str(token_file).strip())
-        else (browser.strip() if (browser and str(browser).strip()) else None),
+        cookies_browser=None,
         token_file=token_file,
         command="ping",
     )
@@ -102,10 +106,6 @@ def _ns(**kwargs: Any) -> argparse.Namespace:
 
 
 class SessionBody(BaseModel):
-    browser: Optional[str] = Field(
-        default=None,
-        description="chrome, firefox, edge, … or omit to auto-detect",
-    )
     token_file: Optional[str] = None
     oauth_cookie_value: Optional[str] = None
 
@@ -131,6 +131,15 @@ class PreviewBuyBody(SessionBody):
     assume_price: Optional[float] = None
 
 
+class DoctorBody(SessionBody):
+    pass
+
+
+class LookupBody(SessionBody):
+    query: str
+    limit: int = 20
+
+
 app = FastAPI(
     title="wsprobe",
     version=__version__,
@@ -143,10 +152,71 @@ def meta() -> dict[str, Any]:
     return {"version": __version__, "wsprobe": True}
 
 
+@app.post("/api/doctor")
+def api_doctor(body: DoctorBody) -> dict[str, Any]:
+    token, src = resolve_session_token(
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
+    args = _ns(
+        json=True,
+        cookies_browser=None,
+        token_file=None,
+        access_token=token,
+        command="doctor",
+    )
+    code, out, err = _capture_stdio(cmd_doctor, args)
+    payload: dict[str, Any] = {
+        "credential_source": src,
+        "exit_code": code,
+        "stderr": err or None,
+    }
+    try:
+        payload["data"] = json.loads(out) if out.strip() else None
+    except json.JSONDecodeError:
+        payload["raw_stdout"] = out
+    if code != 0:
+        raise HTTPException(status_code=502, detail=payload)
+    return payload
+
+
+@app.post("/api/lookup")
+def api_lookup(body: LookupBody) -> dict[str, Any]:
+    q = (body.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="query is required")
+    lim = max(1, min(int(body.limit or 20), 50))
+    token, src = resolve_session_token(
+        token_file=body.token_file,
+        oauth_cookie_value=body.oauth_cookie_value,
+    )
+    args = _ns(
+        query=q,
+        lookup_limit=lim,
+        json=True,
+        cookies_browser=None,
+        token_file=None,
+        access_token=token,
+        command="lookup",
+    )
+    code, out, err = _capture_stdio(cmd_lookup, args)
+    payload: dict[str, Any] = {
+        "credential_source": src,
+        "exit_code": code,
+        "stderr": err or None,
+    }
+    try:
+        payload["data"] = json.loads(out) if out.strip() else None
+    except json.JSONDecodeError:
+        payload["raw_stdout"] = out
+    if code != 0:
+        raise HTTPException(status_code=502, detail=payload)
+    return payload
+
+
 @app.post("/api/ping")
 def api_ping(body: PingBody) -> dict[str, Any]:
     token, src = resolve_session_token(
-        browser=body.browser,
         token_file=body.token_file,
         oauth_cookie_value=body.oauth_cookie_value,
     )
@@ -168,7 +238,6 @@ def api_ping(body: PingBody) -> dict[str, Any]:
 @app.post("/api/security")
 def api_security(body: SecurityBody) -> dict[str, Any]:
     token, src = resolve_session_token(
-        browser=body.browser,
         token_file=body.token_file,
         oauth_cookie_value=body.oauth_cookie_value,
     )
@@ -197,7 +266,6 @@ def api_security(body: SecurityBody) -> dict[str, Any]:
 @app.post("/api/restrictions")
 def api_restrictions(body: RestrictionsBody) -> dict[str, Any]:
     token, src = resolve_session_token(
-        browser=body.browser,
         token_file=body.token_file,
         oauth_cookie_value=body.oauth_cookie_value,
     )
@@ -230,7 +298,6 @@ def api_restrictions(body: RestrictionsBody) -> dict[str, Any]:
 @app.post("/api/preview-buy")
 def api_preview_buy(body: PreviewBuyBody) -> dict[str, Any]:
     token, src = resolve_session_token(
-        browser=body.browser,
         token_file=body.token_file,
         oauth_cookie_value=body.oauth_cookie_value,
     )

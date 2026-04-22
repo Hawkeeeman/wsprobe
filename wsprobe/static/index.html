@@ -95,8 +95,7 @@
     <h1>wsprobe</h1>
     <p class="lead">
       Read-only checks against Wealthsimple on <strong>this computer</strong>.
-      Log in at <a href="https://my.wealthsimple.com" target="_blank" rel="noopener">my.wealthsimple.com</a>,
-      quit the browser, then use the buttons below.
+      Run <code>wsprobe onboard</code> in your terminal first, then use the buttons below.
     </p>
     <div class="warn">
       This page talks to a small server on your machine only (<code>127.0.0.1</code>).
@@ -105,18 +104,7 @@
 
     <section>
       <h2>Session</h2>
-      <label for="browser">Browser cookie source (optional)</label>
-      <select id="browser">
-        <option value="">Auto-detect (recommended)</option>
-        <option value="chrome">Chrome</option>
-        <option value="edge">Edge</option>
-        <option value="firefox">Firefox</option>
-        <option value="brave">Brave</option>
-        <option value="opera">Opera</option>
-        <option value="opera_gx">Opera GX</option>
-        <option value="safari">Safari</option>
-      </select>
-      <label for="token-file">Token file path (optional, bypass browser cookies)</label>
+      <label for="token-file">Token file path (optional, overrides saved session)</label>
       <input id="token-file" type="text" placeholder="e.g. /Users/you/.config/wsprobe/config.json" autocomplete="off" />
     </section>
 
@@ -126,6 +114,32 @@
       <button type="button" id="btn-ping">Run check</button>
       <div class="status" id="st-ping" aria-live="polite"></div>
       <pre id="out-ping" hidden></pre>
+    </section>
+
+    <section>
+      <h2>Doctor</h2>
+      <p style="margin:0 0 0.75rem;font-size:0.85rem;color:var(--muted);">Credentials source, token expiry hint, and a live GraphQL identity check.</p>
+      <button type="button" id="btn-doctor">Run doctor</button>
+      <div class="status" id="st-doctor" aria-live="polite"></div>
+      <pre id="out-doctor" hidden></pre>
+    </section>
+
+    <section>
+      <h2>Lookup (ticker or search)</h2>
+      <p style="margin:0 0 0.75rem;font-size:0.85rem;color:var(--muted);">Resolves a symbol or search text to Wealthsimple <code>sec-s-…</code> ids.</p>
+      <div class="row row-2">
+        <div>
+          <label for="lookup-q">Query</label>
+          <input id="lookup-q" type="text" placeholder="e.g. AAPL" autocomplete="off" />
+        </div>
+        <div>
+          <label for="lookup-limit">Max results</label>
+          <input id="lookup-limit" type="number" min="1" max="50" value="20" />
+        </div>
+      </div>
+      <button type="button" id="btn-lookup">Search</button>
+      <div class="status" id="st-lookup" aria-live="polite"></div>
+      <pre id="out-lookup" hidden></pre>
     </section>
 
     <section>
@@ -195,10 +209,8 @@
   </div>
   <script>
     function sessionBody() {
-      const b = document.getElementById("browser").value;
       const t = document.getElementById("token-file").value.trim();
       const o = {};
-      if (b) o.browser = b;
       if (t) o.token_file = t;
       return o;
     }
@@ -235,6 +247,39 @@
     function showInputError(preId, stId, msg) {
       show(preId, stId, false, msg, { detail: msg });
     }
+    document.getElementById("btn-doctor").onclick = async () => {
+      const b = document.getElementById("btn-doctor");
+      const oldLabel = b.textContent;
+      b.disabled = true;
+      b.textContent = "Running...";
+      try {
+        const data = await post("/api/doctor", {});
+        show("out-doctor", "st-doctor", data.data && data.data.ok, "OK — session: " + data.credential_source, data);
+      } catch (e) {
+        show("out-doctor", "st-doctor", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+      b.textContent = oldLabel;
+    };
+    document.getElementById("btn-lookup").onclick = async () => {
+      const q = document.getElementById("lookup-q").value.trim();
+      if (!q) { showInputError("out-lookup", "st-lookup", "Enter a query (e.g. AAPL)"); return; }
+      const lim = parseInt(document.getElementById("lookup-limit").value, 10) || 20;
+      const b = document.getElementById("btn-lookup");
+      const oldLabel = b.textContent;
+      b.disabled = true;
+      b.textContent = "Searching...";
+      try {
+        const data = await post("/api/lookup", { query: q, limit: lim });
+        const ok = data.data && (data.data.errors == null) && (data.data.http_status === 200);
+        const rows = (data.data && data.data.results) ? data.data.results.length : 0;
+        show("out-lookup", "st-lookup", ok, "OK — " + data.credential_source + " · " + rows + " result(s)", data);
+      } catch (e) {
+        show("out-lookup", "st-lookup", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+      b.textContent = oldLabel;
+    };
     document.getElementById("btn-ping").onclick = async () => {
       const b = document.getElementById("btn-ping");
       const oldLabel = b.textContent;

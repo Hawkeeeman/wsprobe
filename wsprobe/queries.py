@@ -73,3 +73,23 @@ query FetchSoOrdersLimitOrderRestrictions($args: SoOrders_LimitOrderRestrictions
   }
 }
 """
+
+FETCH_SECURITY_SEARCH = """
+query FetchSecuritySearchResult($query: String!) {
+  securitySearch(input: {query: $query}) {
+    results {
+      id
+      buyable
+      status
+      stock {
+        symbol
+        name
+        primaryExchange
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+}
+"""

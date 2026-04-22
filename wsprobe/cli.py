@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from wsprobe import __version__
 from wsprobe.client import (
@@ -12,20 +14,33 @@ from wsprobe.client import (
     graphql_request,
     identity_id_for_graphql,
 )
+from wsprobe.oauth_refresh import access_token_needs_refresh, jwt_exp_unix
 from wsprobe.credentials import (
     CONFIG_FILE,
     SESSION_FILE,
     _persist_bundle,
     ensure_fresh_access_token,
     load_oauth_bundle,
-    resolve_access_token,
 )
 from wsprobe.queries import (
     FETCH_IDENTITY_PACKAGES,
     FETCH_SECURITY,
     FETCH_SECURITY_QUOTES,
+    FETCH_SECURITY_SEARCH,
     FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS,
 )
+
+_PACKAGE_DIR = str(Path(__file__).resolve().parent)
+
+
+def _cli_invocation_name() -> str:
+    """`prog` for argparse: script basename, or "wsprobe" for -m / -c / odd argv0."""
+    if not sys.argv:
+        return "wsprobe"
+    a0 = Path(sys.argv[0]).name
+    if a0 in ("__main__.py", "-c", ""):
+        return "wsprobe"
+    return a0
 
 
 def _print_result(payload: dict[str, Any], *, as_json: bool) -> None:
@@ -109,10 +124,8 @@ def _graphql_query_with_auth_retry(
 
 
 def cmd_easy(args: argparse.Namespace) -> int:
-    """Auto-find cookies, then connectivity check — minimal thinking."""
-    bundle, persist, src = load_oauth_bundle(args)
-    if not args.json and src.startswith("browser:"):
-        print(f"Using cookies from: {src.split(':', 1)[1]}", file=sys.stderr)
+    """Resolve saved/env credentials, then connectivity check."""
+    bundle, persist, _src = load_oauth_bundle(args)
     token = ensure_fresh_access_token(bundle, persist_path=persist)
     return run_ping_with_token(token, args, oauth_bundle=bundle)
 
@@ -187,8 +200,38 @@ def cmd_session_path(_: argparse.Namespace) -> int:
     return 0
 
 
+def _bundle_from_pasted_text(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        raise SystemExit("No input received.")
+
+    candidates: list[str] = [text]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if lines:
+        candidates.append(lines[-1])
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start : end + 1])
+
+    for cand in candidates:
+        c = cand.strip()
+        if not c:
+            continue
+        for payload in (c, unquote(c)):
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and data.get("access_token"):
+                return data
+
+    raise SystemExit("Could not parse credentials JSON. Paste the console output JSON object.")
+
+
 def cmd_import_session(args: argparse.Namespace) -> int:
-    """Write pasted JSON (access_token + optional refresh_token) to session.json."""
+    """Write pasted credentials JSON to session.json."""
     path_arg = getattr(args, "import_session_file", None)
     if path_arg:
         raw = Path(path_arg).expanduser().read_text(encoding="utf-8")
@@ -196,9 +239,7 @@ def cmd_import_session(args: argparse.Namespace) -> int:
         raw = sys.stdin.read()
     if not raw.strip():
         raise SystemExit("No JSON input (give a file path or pipe JSON on stdin)")
-    data = json.loads(raw)
-    if not isinstance(data, dict) or not data.get("access_token"):
-        raise SystemExit("JSON must be an object with at least access_token")
+    data = _bundle_from_pasted_text(raw)
     _persist_bundle(SESSION_FILE, data)
     print(f"Saved credentials to {SESSION_FILE}", file=sys.stderr)
     return 0
@@ -353,6 +394,211 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _access_token_brief(access: str) -> dict[str, Any]:
+    exp = jwt_exp_unix(access)
+    brief: dict[str, Any] = {
+        "needs_refresh_soon": access_token_needs_refresh(access),
+    }
+    if exp is not None:
+        brief["expires_at_utc"] = datetime.fromtimestamp(exp, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        brief["expires_at_unix"] = exp
+    return brief
+
+
+def cmd_lookup(args: argparse.Namespace) -> int:
+    q = (getattr(args, "query", None) or "").strip()
+    if not q:
+        raise SystemExit("Enter a search string (ticker, name, or ISIN). Example:  wsprobe lookup AAPL")
+    limit = int(getattr(args, "lookup_limit", 20))
+    limit = max(1, min(limit, 50))
+
+    status, payload, raw = _graphql_query_with_auth_retry(
+        args,
+        operation_name="FetchSecuritySearchResult",
+        query=FETCH_SECURITY_SEARCH,
+        variables={"query": q},
+    )
+    if raw:
+        print(raw, file=sys.stderr)
+        return 1
+    assert payload is not None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    err = payload.get("errors") if isinstance(payload, dict) else None
+    block = (data or {}).get("securitySearch") if isinstance(data, dict) else None
+    results: list[dict[str, Any]] = []
+    if isinstance(block, dict) and block.get("results"):
+        raw_results = block["results"]
+        if isinstance(raw_results, list):
+            for item in raw_results:
+                if isinstance(item, dict):
+                    results.append(item)
+    results = results[:limit]
+
+    if args.json:
+        print(
+            format_json(
+                {
+                    "http_status": status,
+                    "query": q,
+                    "errors": err,
+                    "results": results,
+                }
+            )
+        )
+        if status != 200 or err:
+            return 1
+        return 0
+
+    print(f"HTTP {status}", file=sys.stderr)
+    if err:
+        print("errors:", file=sys.stderr)
+        print(format_json(err), file=sys.stderr)
+        return 1
+
+    if not results:
+        print("No results (try a different search string).", file=sys.stderr)
+        return 1
+
+    q_upper = q.upper()
+    for row in results:
+        st = (row.get("stock") or {}) if isinstance(row.get("stock"), dict) else {}
+        sym = (st.get("symbol") or "") or ""
+        if sym.upper() == q_upper:
+            row["_exact_symbol_match"] = True
+    try:
+        results.sort(
+            key=lambda r: (not r.get("_exact_symbol_match", False), (r.get("stock") or {}).get("symbol") or ""),
+        )
+    except (TypeError, ValueError, AttributeError):
+        pass
+    for r in results:
+        r.pop("_exact_symbol_match", None)
+
+    name_w = max(len("Name"), max(len((x.get("stock") or {}).get("name") or "") for x in results))
+    sym_w = max(len("Symbol"), max(len((x.get("stock") or {}).get("symbol") or "") for x in results))
+    line = f"{'Symbol':{sym_w}}  {'Name':{name_w}}  Exchange  Security id"
+    print(line)
+    for row in results:
+        st = (row.get("stock") or {}) if isinstance(row.get("stock"), dict) else {}
+        sym = st.get("symbol") or "—"
+        name = (st.get("name") or "")[:80] or "—"
+        ex = st.get("primaryExchange") or "—"
+        sid = row.get("id") or "—"
+        print(f"{sym:{sym_w}}  {name:{name_w}}  {ex}  {sid}")
+    print(
+        f"\nUse  wsprobe security <id>  or  wsprobe preview-buy <id> …  with a security id above."
+    )
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    import os as _os
+
+    report: dict[str, Any] = {
+        "wsprobe_version": __version__,
+        "wprobe_no_refresh": _os.environ.get("WSPROBE_NO_REFRESH", "").strip().lower() in ("1", "true", "yes"),
+    }
+    try:
+        bundle, persist, src = load_oauth_bundle(args)
+    except SystemExit as e:
+        report["ok"] = False
+        report["credentials"] = {"error": str(e)}
+        if args.json:
+            print(format_json(report))
+        else:
+            print("wsprobe doctor", file=sys.stderr)
+            print("  Credentials: failed —", e, file=sys.stderr)
+        return 1
+
+    path_label = str(persist) if persist is not None else None
+    report["credentials"] = {
+        "source": src,
+        "persist_path": path_label,
+        "has_refresh_token": bool((bundle.get("refresh_token") or "").strip()),
+    }
+    acc = str(bundle.get("access_token") or "")
+    report["access_token"] = _access_token_brief(acc)
+
+    token = ensure_fresh_access_token(bundle, persist_path=persist)
+    sub = identity_id_for_graphql(token, bundle)
+    if not sub:
+        report["ok"] = False
+        report["graphql_identity"] = {
+            "ok": False,
+            "detail": "Could not read identity id from token (expired, malformed, or missing claims).",
+        }
+        if args.json:
+            print(format_json(report))
+        else:
+            _print_doctor_text(report, ok=False)
+        return 1
+
+    st, pl, raw = graphql_request(
+        access_token=token,
+        operation_name="FetchIdentityPackages",
+        query=FETCH_IDENTITY_PACKAGES,
+        variables={"id": sub},
+        oauth_bundle=bundle,
+    )
+    if st == 401 and bundle.get("refresh_token"):
+        token = ensure_fresh_access_token(bundle, persist_path=persist, force_refresh=True)
+        st, pl, raw = graphql_request(
+            access_token=token,
+            operation_name="FetchIdentityPackages",
+            query=FETCH_IDENTITY_PACKAGES,
+            variables={"id": sub},
+            oauth_bundle=bundle,
+        )
+
+    gq_ok = st == 200 and isinstance(pl, dict) and not pl.get("errors")
+    report["graphql_identity"] = {
+        "ok": gq_ok,
+        "http_status": st,
+        "graphql_errors": pl.get("errors") if isinstance(pl, dict) else None,
+    }
+    if raw:
+        report["graphql_identity"]["raw"] = raw
+    report["ok"] = bool(gq_ok)
+
+    if args.json:
+        print(format_json(report))
+    else:
+        _print_doctor_text(report, ok=bool(gq_ok))
+    return 0 if gq_ok else 1
+
+
+def _print_doctor_text(report: dict[str, Any], *, ok: bool) -> None:
+    print("wsprobe doctor", file=sys.stderr)
+    cred = report.get("credentials") or {}
+    if cred.get("error"):
+        print("  Credentials: failed —", cred["error"], file=sys.stderr)
+        return
+    print("  Credentials: ok —", cred.get("source"), file=sys.stderr)
+    if cred.get("persist_path"):
+        print("  Save tokens to:     ", cred["persist_path"], file=sys.stderr)
+    print("  refresh_token:      ", "yes" if cred.get("has_refresh_token") else "no", file=sys.stderr)
+    at = report.get("access_token") or {}
+    if at.get("expires_at_utc"):
+        print("  access JWT expires:", at["expires_at_utc"], file=sys.stderr)
+    elif at:
+        print("  access JWT:         (no exp claim in token)", file=sys.stderr)
+    if at.get("needs_refresh_soon"):
+        print("  note:              token is expired or expiring (refresh was applied if available)", file=sys.stderr)
+    gq = report.get("graphql_identity") or {}
+    if gq.get("ok"):
+        print("  GraphQL identity:   HTTP 200, no errors", file=sys.stderr)
+    else:
+        print("  GraphQL identity:   failed (HTTP", gq.get("http_status"), ")", file=sys.stderr)
+        if gq.get("graphql_errors"):
+            print(format_json(gq["graphql_errors"]), file=sys.stderr)
+    print(
+        "All checks passed." if ok else "One or more checks failed.",
+        file=sys.stderr,
+    )
+
+
 def cmd_export_session_snippet(args: argparse.Namespace) -> int:
     """Print JS for pasting into DevTools on my.wealthsimple.com to build session.json."""
     print(
@@ -360,33 +606,53 @@ def cmd_export_session_snippet(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     base = Path(__file__).resolve().parent
-    if getattr(args, "export_session_full", False):
-        path = base / "export_session_console.js"
-    else:
-        minp = base / "export_session_console.min.js"
-        path = minp if minp.is_file() else base / "export_session_console.js"
+    path = base / "export_session_console.js"
     sys.stdout.write(path.read_text(encoding="utf-8"))
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
+def cmd_onboard(args: argparse.Namespace) -> int:
+    print(
+        "Step 1: open https://my.wealthsimple.com and sign in.\n"
+        "Step 2: paste this snippet into DevTools Console and run it.\n",
+        file=sys.stderr,
+    )
+    cmd_export_session_snippet(args)
+    print(
+        "\n\nStep 3: paste the console output JSON below, then press Ctrl-D:\n",
+        file=sys.stderr,
+    )
+    raw = sys.stdin.read()
+    data = _bundle_from_pasted_text(raw)
+    _persist_bundle(SESSION_FILE, data)
+    print(f"Saved credentials to {SESSION_FILE}", file=sys.stderr)
+    return 0
+
+
+
+def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
+    inv = prog or _cli_invocation_name()
     p = argparse.ArgumentParser(
-        prog="wsprobe",
+        prog=inv,
         description=(
             "Wealthsimple GraphQL (read-only). GraphQL mutations stay blocked. "
-            "Easiest check: run wsprobe with no arguments — it tries common browsers for you."
+            "If another program named wsprobe is on your PATH, use the wsp command "
+            "(same tool from this install) or see --version for the package path. "
+            "Easiest check: run with no subcommand after onboarding."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Easiest flow:\n"
             "  1) pip install (see install-wsprobe.sh in repo)\n"
-            "  2) Log in at my.wealthsimple.com, then quit the browser\n"
-            "  3) Run:  wsprobe\n"
+            "  2) Run:  wsprobe onboard\n"
+            "  3) Paste snippet in browser console, then paste JSON back into terminal\n"
+            "  4) Run:  wsp   or  wsprobe   (after  pip install -e .  in this project)\n"
             "\n"
             "More:\n"
             "  %(prog)s easy              same as bare %(prog)s\n"
-            "  %(prog)s --cookies-from-browser firefox ping\n"
-            "  %(prog)s --cookies-from-browser chrome security sec-s-…\n"
+            "  %(prog)s onboard           guided one-time credential import flow\n"
+            "  %(prog)s lookup AAPL        resolve ticker/search text → security ids (sec-s-…)\n"
+            "  %(prog)s doctor             credentials + GraphQL health (try this if auth fails)\n"
             "  %(prog)s preview-buy sec-s-… --shares 1 --order market --assume-price 264\n"
             "  %(prog)s export-session-snippet     print JS: paste on my.wealthsimple.com → session.json\n"
             "  %(prog)s session-path               print where session.json lives (~/.config/wsprobe/)\n"
@@ -398,16 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {__version__}",
-    )
-    p.add_argument(
-        "--cookies-from-browser",
-        dest="cookies_browser",
-        metavar="BROWSER",
-        help=(
-            "Use this browser's cookie store (chrome, firefox, edge, opera, opera_gx, brave, safari, vivaldi). "
-            "Quit the browser before running if cookie read fails."
-        ),
+        version=f"%(prog)s {__version__}  [package: {_PACKAGE_DIR}]",
     )
     p.add_argument(
         "--token-file",
@@ -442,15 +699,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "easy",
-        help="Auto-detect browser cookies + connectivity check (default if you type nothing)",
+        help="Connectivity check using saved/env credentials (default if you type nothing)",
     )
     sp.set_defaults(func=cmd_easy)
+
+    sp = sub.add_parser(
+        "onboard",
+        help="Guided setup: paste console snippet output and save credentials",
+    )
+    sp.set_defaults(func=cmd_onboard)
 
     sp = sub.add_parser(
         "ping",
         help="Connectivity check (identity packages)",
     )
     sp.set_defaults(func=cmd_ping)
+
+    sp = sub.add_parser(
+        "lookup",
+        help="Search by ticker, name, or text → security ids (sec-s-…)",
+    )
+    sp.add_argument(
+        "query",
+        help="e.g. AAPL, company name, or other search text (same as the app search)",
+    )
+    sp.add_argument(
+        "--limit",
+        dest="lookup_limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="max rows to show (default: 20, max: 50)",
+    )
+    sp.set_defaults(func=cmd_lookup)
+
+    sp = sub.add_parser(
+        "doctor",
+        help="Check credentials, token expiry hint, and GraphQL identity query",
+    )
+    sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("status", help="Same as doctor")
+    sp.set_defaults(func=cmd_doctor)
 
     sp = sub.add_parser(
         "security",
@@ -519,7 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "session-path",
-        help="Print path to session.json (saved OAuth tokens from browser or manual paste)",
+        help="Print path to session.json (saved OAuth tokens)",
     )
     sp.set_defaults(func=cmd_session_path)
 
@@ -544,12 +834,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "export-session-snippet",
         help="Print console script: paste on my.wealthsimple.com to emit ~/.config/wsprobe/session.json",
-    )
-    sp.add_argument(
-        "--full",
-        action="store_true",
-        dest="export_session_full",
-        help="Print readable multi-line source (default is one-line minified)",
     )
     sp.set_defaults(func=cmd_export_session_snippet)
 

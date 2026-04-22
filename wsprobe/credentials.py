@@ -46,12 +46,8 @@ def _persist_bundle(path: Path, bundle: dict[str, Any]) -> None:
         except json.JSONDecodeError:
             pass
     for key in ("access_token", "refresh_token", "client_id"):
-        if key not in bundle:
-            continue
-        if bundle[key]:
+        if key in bundle and bundle[key]:
             existing[key] = bundle[key]
-        else:
-            existing.pop(key, None)
     path.write_text(json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -96,8 +92,8 @@ def ensure_fresh_access_token(
     if not refresh_s:
         raise SystemExit(
             "Access token is expired or near expiry and no refresh_token is available. "
-            "Log in at https://my.wealthsimple.com (browser cookies), or add refresh_token "
-            "to your token file / set WEALTHSIMPLE_REFRESH_TOKEN."
+            "Run wsprobe onboard again, or add refresh_token to your token file / "
+            "set WEALTHSIMPLE_REFRESH_TOKEN."
         )
 
     cid = bundle.get("client_id")
@@ -126,20 +122,9 @@ def ensure_fresh_access_token(
     return str(new_access)
 
 
-def _browser_bundle_persisted(bundle: dict[str, Any], source_label: str) -> tuple[dict[str, Any], Path, str]:
-    """Merge empty refresh to drop stale file keys, persist, return (bundle, persist_path, label)."""
-    if "refresh_token" not in bundle:
-        bundle = dict(bundle)
-        bundle["refresh_token"] = ""
-    _persist_bundle(SESSION_FILE, bundle)
-    return bundle, SESSION_FILE, source_label
-
-
 def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str]:
     """
-    Returns OAuth dict, path to persist refreshed tokens (if any), and a short source label.
-    Order matches wsprobe-serve: prefer live browser cookies over stale on-disk session so CLI
-    and local UI use the same resolution.
+    Resolve OAuth credentials and return (bundle, persist_path, source_label).
     """
     injected = getattr(args, "access_token", None)
     if injected:
@@ -165,14 +150,6 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
             raise SystemExit(f"No access_token in {p}")
         return data, p, f"file:{p}"
 
-    browser = getattr(args, "cookies_browser", None)
-    if browser:
-        from wsprobe.browser_cookies import oauth2_bundle_from_browser
-
-        b = str(browser).strip()
-        br = oauth2_bundle_from_browser(b)
-        return _browser_bundle_persisted(br, f"browser:{b}")
-
     oauth_json = os.environ.get("WEALTHSIMPLE_OAUTH_JSON", "").strip()
     if oauth_json:
         try:
@@ -194,16 +171,6 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
             d["client_id"] = cid
         return d, None, "env"
 
-    from wsprobe.browser_cookies import oauth2_bundle_first_available
-
-    try:
-        br, name = oauth2_bundle_first_available()
-    except SystemExit:
-        br = None
-        name = ""
-    if br and br.get("access_token"):
-        return _browser_bundle_persisted(br, f"browser:{name}")
-
     if CONFIG_FILE.is_file():
         data = _load_bundle_from_file(CONFIG_FILE)
         if data:
@@ -214,11 +181,10 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
         return session, SESSION_FILE, f"session:{SESSION_FILE}"
 
     raise SystemExit(
-        "No credentials. Easiest:\n"
-        "  wsprobe\n"
-        "or:\n"
-        "  wsprobe --cookies-from-browser chrome ping\n"
-        "Or: paste JSON into  wsprobe import-session  (see  wsprobe session-path  for file location)\n"
+        "No credentials found.\n"
+        "Run onboarding once:\n"
+        "  wsprobe onboard\n"
+        "Or paste JSON into  wsprobe import-session  (see  wsprobe session-path  for file location)\n"
         "Or set WEALTHSIMPLE_OAUTH_JSON (JSON with access_token + optional refresh_token), "
         "or WEALTHSIMPLE_ACCESS_TOKEN / WEALTHSIMPLE_REFRESH_TOKEN / --token-file / "
         f"{CONFIG_FILE}"

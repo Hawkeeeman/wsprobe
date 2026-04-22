@@ -1,14 +1,12 @@
 // Paste into DevTools Console on https://my.wealthsimple.com (logged in).
-// Tries: document cookie, Cookie Store, __NEXT_DATA__, localStorage/sessionStorage, window globals; optional paste; then hints for wsprobe --cookies-from-browser.
-// Regenerate one-liner: npx terser wsprobe/export_session_console.js -c -m -o wsprobe/export_session_console.min.js
 (function () {
   function bundleFromObject(obj, depth) {
     if (depth > 8 || !obj || typeof obj !== "object") return null;
     if (typeof obj.access_token === "string" && obj.access_token.length > 20) {
-      const o = { access_token: obj.access_token };
-      if (typeof obj.refresh_token === "string") o.refresh_token = obj.refresh_token;
-      if (typeof obj.client_id === "string") o.client_id = obj.client_id;
-      return o;
+      const out = { access_token: obj.access_token };
+      if (typeof obj.refresh_token === "string") out.refresh_token = obj.refresh_token;
+      if (typeof obj.client_id === "string") out.client_id = obj.client_id;
+      return out;
     }
     if (Array.isArray(obj)) {
       for (const x of obj) {
@@ -24,17 +22,6 @@
       } catch (_) {}
     }
     return null;
-  }
-
-  function tryDocumentCookie() {
-    const m = document.cookie.match(/(?:^|;\s*)_oauth2_access_v2=([^;]+)/);
-    if (!m) return null;
-    try {
-      const raw = decodeURIComponent(m[1].trim());
-      return bundleFromObject(JSON.parse(raw), 0);
-    } catch (_) {
-      return null;
-    }
   }
 
   function tryStorage() {
@@ -68,8 +55,15 @@
   }
 
   function tryWindowGlobals() {
+    const direct = [window.__NEXT_DATA__, window.__APOLLO_STATE__, window.__NUXT__];
+    for (const candidate of direct) {
+      try {
+        const b = bundleFromObject(candidate, 0);
+        if (b) return b;
+      } catch (_) {}
+    }
     const keys = Object.keys(window).filter((k) =>
-      /oauth|apollo|relay|__.*(ws|WS|auth|Auth|token|Token|store|Store)/i.test(k),
+      /oauth|apollo|relay|auth|token|session|store/i.test(k),
     );
     for (const k of keys) {
       try {
@@ -80,73 +74,20 @@
     return null;
   }
 
-  function finish(bundle) {
-    const out = JSON.stringify(bundle, null, 2);
-    console.log(out);
-    if (typeof copy === "function") {
-      copy(out);
-      console.log("Copied. Save as file: ~/.config/wsprobe/session.json");
-    } else {
-      console.log("Save the JSON above to: ~/.config/wsprobe/session.json");
-    }
-  }
-
-  function fail() {
-    console.warn(
-      "%cStill stuck?",
-      "font-weight:bold;font-size:14px",
-      "\nQuit your browser, then run:  wsprobe --cookies-from-browser chrome ping",
+  const bundle = tryStorage() || tryNextData() || tryWindowGlobals();
+  if (!bundle) {
+    console.error(
+      "Could not locate access_token in page state. Open a logged-in my.wealthsimple.com tab and try again.",
     );
-  }
-
-  const sync =
-    tryDocumentCookie() ||
-    tryStorage() ||
-    tryNextData() ||
-    tryWindowGlobals();
-
-  if (sync) {
-    finish(sync);
     return;
   }
 
-  void (async function () {
-    if (typeof cookieStore !== "undefined") {
-      try {
-        const c = await cookieStore.get({
-          name: "_oauth2_access_v2",
-          url: "https://my.wealthsimple.com/",
-        });
-        if (c && typeof c.value === "string" && c.value.length > 0) {
-          const raw = decodeURIComponent(c.value.trim());
-          const ob = bundleFromObject(JSON.parse(raw), 0);
-          if (ob) {
-            finish(ob);
-            return;
-          }
-        }
-      } catch (_) {}
-    }
-
-    let p = null;
-    if (typeof prompt === "function") {
-      p = prompt(
-        "Paste the Value of cookie _oauth2_access_v2 (Application → Cookies → my.wealthsimple.com). Or Cancel.",
-      );
-    }
-    if (p && String(p).trim()) {
-      try {
-        const t = String(p).trim();
-        const data = JSON.parse(t.startsWith("{") ? t : decodeURIComponent(t));
-        const ob = bundleFromObject(data, 0);
-        if (ob) {
-          finish(ob);
-          return;
-        }
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    fail();
-  })();
+  const out = JSON.stringify(bundle, null, 2);
+  console.log(out);
+  if (typeof copy === "function") {
+    copy(out);
+    console.info("Copied JSON to clipboard. Paste into the waiting wsprobe terminal.");
+  } else {
+    console.info("Copy the JSON above, then paste it into the waiting wsprobe terminal.");
+  }
 })();

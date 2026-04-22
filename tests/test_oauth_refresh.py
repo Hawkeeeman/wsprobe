@@ -217,11 +217,8 @@ class TestCredentialSourceOrder(unittest.TestCase):
         self.assertEqual(bundle["refresh_token"], "cli-rt")
         self.assertEqual(src, "injected")
 
-    @patch("wsprobe.browser_cookies.oauth2_bundle_first_available", side_effect=SystemExit(1))
-    def test_session_file_used_when_config_missing(
-        self, _mock_first_browser: object
-    ) -> None:
-        """No browser session: fall back to session.json (browser try fails first)."""
+    def test_session_file_used_when_config_missing(self) -> None:
+        """When config is missing, fall back to session.json."""
         session_path = Path(__file__).resolve().parent / "_tmp_session.json"
         data = {"access_token": "session-token", "refresh_token": "session-refresh"}
         session_path.write_text(json.dumps(data), encoding="utf-8")
