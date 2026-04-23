@@ -137,7 +137,7 @@ def cmd_ping(args: argparse.Namespace) -> int:
 
 
 def cmd_security(args: argparse.Namespace) -> int:
-    sid = args.security_id.strip()
+    sid = _normalize_security_id(args.security_id)
     status, payload, raw = _graphql_query_with_auth_retry(
         args,
         operation_name="FetchIntraDayChartQuotes",
@@ -172,7 +172,7 @@ def cmd_restrictions(args: argparse.Namespace) -> int:
         query=FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS,
         variables={
             "args": {
-                "securityId": args.security_id.strip(),
+                "securityId": _normalize_security_id(args.security_id),
                 "side": side,
             }
         },
@@ -230,6 +230,79 @@ def _bundle_from_pasted_text(raw: str) -> dict[str, Any]:
     raise SystemExit("Could not parse credentials JSON. Paste the console output JSON object.")
 
 
+def _normalize_security_id(raw: str) -> str:
+    val = (raw or "").strip()
+    if not val:
+        raise SystemExit("security_id is required (expected format: sec-s-...)")
+
+    if "sec-s-" in val and not val.startswith("sec-s-"):
+        start = val.find("sec-s-")
+        end = len(val)
+        for sep in ("?", "&", "#", "/", " "):
+            idx = val.find(sep, start)
+            if idx != -1:
+                end = min(end, idx)
+        val = val[start:end]
+
+    if not val.startswith("sec-s-"):
+        raise SystemExit(
+            "Invalid security_id format. Expected a Wealthsimple security id like "
+            "'sec-s-...'. Use `wsprobe lookup <ticker>` to find it."
+        )
+    return val
+
+
+def _resolve_security_id_from_query(args: argparse.Namespace, query_text: str) -> str:
+    q = (query_text or "").strip()
+    if not q:
+        raise SystemExit("security_id is required (expected sec-s-... or a ticker like GOOG)")
+
+    status, payload, raw = _graphql_query_with_auth_retry(
+        args,
+        operation_name="FetchSecuritySearchResult",
+        query=FETCH_SECURITY_SEARCH,
+        variables={"query": q},
+    )
+    if raw:
+        raise SystemExit(raw)
+    if status != 200 or not isinstance(payload, dict):
+        raise SystemExit(f"Security lookup failed (HTTP {status}).")
+    if payload.get("errors"):
+        raise SystemExit(format_json(payload.get("errors")))
+
+    block = (payload.get("data") or {}).get("securitySearch")
+    results = block.get("results") if isinstance(block, dict) else None
+    if not isinstance(results, list) or not results:
+        raise SystemExit(f"No security found for '{q}'.")
+
+    q_upper = q.upper()
+    exact_symbol = None
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        stock = item.get("stock")
+        sym = stock.get("symbol") if isinstance(stock, dict) else None
+        if isinstance(sym, str) and sym.upper() == q_upper:
+            exact_symbol = item
+            break
+
+    chosen = exact_symbol if exact_symbol is not None else results[0]
+    sid = chosen.get("id") if isinstance(chosen, dict) else None
+    if not isinstance(sid, str) or not sid.startswith("sec-s-"):
+        raise SystemExit(
+            f"Could not resolve a valid security id for '{q}'. "
+            "Run `wsprobe lookup <ticker>` and pass the sec-s-... id."
+        )
+    return sid
+
+
+def _resolve_security_id_arg(args: argparse.Namespace, raw: str) -> str:
+    try:
+        return _normalize_security_id(raw)
+    except SystemExit:
+        return _resolve_security_id_from_query(args, raw)
+
+
 def cmd_import_session(args: argparse.Namespace) -> int:
     """Write pasted credentials JSON to session.json."""
     path_arg = getattr(args, "import_session_file", None)
@@ -250,7 +323,7 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
     Read-only buy preflight using GraphQL queries only.
     Never submits, confirms, or finalizes an order.
     """
-    sid = args.security_id.strip()
+    sid = _resolve_security_id_arg(args, args.security_id)
     shares = float(args.shares)
     if shares <= 0:
         raise SystemExit("--shares must be positive")
@@ -270,7 +343,7 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
         args,
         operation_name="FetchSecurity",
         query=FETCH_SECURITY,
-        variables={"securityId": sid, "currency": None},
+        variables={"securityId": sid},
     )
     st_b, pl_b, raw_b = _graphql_query_with_auth_retry(
         args,
@@ -300,9 +373,20 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
         "assumed_price_per_share_usd": assume,
     }
 
+    restrictions_unprocessable = bool(
+        isinstance(err_b, list)
+        and any(
+            isinstance(e, dict)
+            and isinstance(e.get("extensions"), dict)
+            and e.get("extensions", {}).get("code") == "UNPROCESSABLE_ENTITY"
+            for e in err_b
+        )
+    )
+    restrictions_skipped = bool(restrictions_unprocessable and not rest)
+
     if args.json:
         ok_security = st_a == 200 and not err_a
-        ok_restrictions = st_b == 200 and not err_b
+        ok_restrictions = st_b == 200 and (not err_b or restrictions_skipped)
         ready = bool(ok_security and ok_restrictions)
         out = {
             "preview_only": True,
@@ -310,6 +394,14 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
             "checked": {
                 "security_quote_lookup": True,
                 "buy_side_limit_restrictions": True,
+            },
+            "notes": {
+                "restrictions_skipped": restrictions_skipped,
+                "restrictions_skip_reason": (
+                    "UNPROCESSABLE_ENTITY from restrictions endpoint"
+                    if restrictions_skipped
+                    else None
+                ),
             },
             "result": {
                 "security_ok": ok_security,
@@ -368,22 +460,25 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
     print()
     print("Check 2/2: BUY-side limit-order restrictions")
     print(f"  HTTP status:     {st_b}")
-    if err_b:
+    if err_b and not restrictions_skipped:
         print("  GraphQL errors:  yes")
     else:
         print("  GraphQL errors:  no")
+        if restrictions_skipped:
+            print("  note:            endpoint returned UNPROCESSABLE_ENTITY; skipping restrictions check")
     if rest:
         print("  Raw payload:")
         print(format_json(rest))
     else:
         print("  (no restrictions data)")
 
-    if err_a or err_b:
+    blocking_err_b = bool(err_b) and not restrictions_skipped
+    if err_a or blocking_err_b:
         print()
         print("Preview failed: GraphQL errors detected.", file=sys.stderr)
         if err_a:
             print(format_json(err_a), file=sys.stderr)
-        if err_b:
+        if blocking_err_b:
             print(format_json(err_b), file=sys.stderr)
         return 1
 

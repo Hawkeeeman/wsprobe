@@ -14,12 +14,11 @@ query FetchIdentityPackages($id: ID!) {
 """
 
 FETCH_SECURITY = """
-query FetchSecurity($securityId: ID!, $currency: Currency) {
+query FetchSecurity($securityId: ID!) {
   security(id: $securityId) {
     id
     active
     buyable
-    currency
     wsTradeEligible
     wsTradeIneligibilityReason
     status
