@@ -629,6 +629,11 @@ def cmd_onboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_snippet(args: argparse.Namespace) -> int:
+    """Alias for onboard: print snippet, then wait for pasted JSON and save."""
+    return cmd_onboard(args)
+
+
 
 def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     inv = prog or _cli_invocation_name()
@@ -650,6 +655,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
             "\n"
             "More:\n"
             "  %(prog)s easy              same as bare %(prog)s\n"
+            "  %(prog)s snippet           print snippet, wait for pasted JSON, save session\n"
             "  %(prog)s onboard           guided one-time credential import flow\n"
             "  %(prog)s lookup AAPL        resolve ticker/search text → security ids (sec-s-…)\n"
             "  %(prog)s doctor             credentials + GraphQL health (try this if auth fails)\n"
@@ -708,6 +714,12 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         help="Guided setup: paste console snippet output and save credentials",
     )
     sp.set_defaults(func=cmd_onboard)
+
+    sp = sub.add_parser(
+        "snippet",
+        help="Print snippet, then wait for pasted JSON and save credentials",
+    )
+    sp.set_defaults(func=cmd_snippet)
 
     sp = sub.add_parser(
         "ping",
