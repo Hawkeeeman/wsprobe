@@ -5,4 +5,4 @@ alwaysApply: true
 
 # Trading workspace
 
-Primary Python package is **`wsprobe/`** (CLI: `python3 -m wsprobe`): read-only Wealthsimple GraphQL + preview-buy; GraphQL mutations stay blocked in `client.py`. Optional local UI: `pip install -e '.[web]'` then `wsprobe-serve` (read-only). The repo also contains other bots, scripts, and sim code — prefer the smallest change that matches the user’s request.
+Primary Python package is **`wsprobe/`** (CLI: `python3 -m wsprobe`): read-only Wealthsimple GraphQL in `client.py` (mutations blocked there); Trade REST in `trade_service.py` for `accounts`, `portfolio`, `positions`, and direct `buy` to trade-service (not SnapTrade). Optional local UI: `pip install -e '.[web]'` then `wsprobe-serve` (read-only). The repo also contains other bots, scripts, and sim code — prefer the smallest change that matches the user’s request.

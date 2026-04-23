@@ -1,6 +1,6 @@
 # wsprobe
 
-Local CLI and optional web UI for Wealthsimple read-only GraphQL checks, plus Trade REST market buys.
+Local CLI and optional web UI for Wealthsimple: read-only GraphQL, Trade REST for accounts/portfolio, and optional direct market buys (same OAuth session; not SnapTrade).
 
 ## Install
 
@@ -40,6 +40,5 @@ Then open `http://127.0.0.1:8765/`.
 
 ## Notes
 
-- GraphQL mutations are blocked in `wsprobe/client.py`.
+- GraphQL mutations are blocked in `wsprobe/client.py`; market buys use Trade REST (`wsprobe buy`, see `--help`).
 - OAuth refresh is supported using `refresh_token` when available.
-- SnapTrade support is optional (`pip install -e '.[trade]'`).
