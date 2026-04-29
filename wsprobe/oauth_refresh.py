@@ -8,6 +8,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any
 
 # Public web client id shipped with my.wealthsimple.com (not a user secret).
@@ -76,6 +77,50 @@ def _auth_json_request(
     return status, payload
 
 
+def _browser_like_refresh_headers(*, access_token: str | None = None) -> dict[str, str]:
+    try:
+        from wsprobe.browser_cookies import wealthsimple_request_context_first_available
+
+        ctx = wealthsimple_request_context_first_available()
+    except Exception:
+        ctx = {}
+    session_id = (ctx.get("ws_global_visitor_id") or "").strip() or str(uuid.uuid4())
+    device_id = (ctx.get("wssdi") or "").strip() or str(uuid.uuid4())
+    app_instance = str(uuid.uuid4())
+    headers = {
+        "accept": "application/json",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "origin": "https://my.wealthsimple.com",
+        "referer": "https://my.wealthsimple.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        ),
+        "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "x-wealthsimple-client": "@wealthsimple/wealthsimple",
+        "x-ws-client-tier": "core",
+        "x-platform-os": "web",
+        "x-ws-profile": "invest",
+        "x-ws-api-version": "12",
+        "x-app-instance-id": app_instance,
+        "x-ws-session-id": session_id,
+        "x-ws-device-id": device_id,
+    }
+    if access_token:
+        headers["authorization"] = f"Bearer {access_token}"
+    cookie_header = (ctx.get("cookie_header") or "").strip()
+    if cookie_header:
+        headers["cookie"] = cookie_header
+    return headers
+
+
 def jwt_exp_unix(access_token: str) -> int | None:
     parts = access_token.split(".")
     if len(parts) < 2:
@@ -108,6 +153,7 @@ def refresh_access_token(
     refresh_token: str,
     *,
     client_id: str = DEFAULT_OAUTH_CLIENT_ID,
+    access_token: str | None = None,
     timeout_s: float = 30.0,
 ) -> dict[str, Any]:
     """
@@ -118,16 +164,39 @@ def refresh_access_token(
     if not rt:
         raise ValueError("refresh_token is empty")
 
-    status, out = _auth_json_request(
-        "POST",
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": rt,
+        "client_id": client_id,
+    }
+    headers = _browser_like_refresh_headers(access_token=access_token)
+    req = urllib.request.Request(
         OAUTH_TOKEN_URL,
-        timeout_s=timeout_s,
-        json_body={
-            "grant_type": "refresh_token",
-            "refresh_token": rt,
-            "client_id": client_id,
-        },
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
     )
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
+            status = getattr(resp, "status", 200) or 200
+            text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        text = e.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text) if text.strip() else {}
+        except json.JSONDecodeError:
+            payload = {"_raw_preview": " ".join(text.split())[:320]}
+        raise RuntimeError(f"OAuth refresh failed HTTP {status}: {payload}") from None
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise RuntimeError(f"OAuth refresh network error: {e}") from e
+    try:
+        out = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"OAuth refresh invalid JSON: {text[:300]}") from e
+    if not isinstance(out, dict):
+        raise RuntimeError(f"OAuth refresh invalid payload type: {type(out).__name__}")
     if status != 200:
         raise RuntimeError(f"OAuth refresh unexpected HTTP {status}: {out}")
     if not out.get("access_token"):

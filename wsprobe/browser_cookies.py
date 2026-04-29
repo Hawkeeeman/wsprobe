@@ -7,6 +7,8 @@ from typing import Any, Callable, Iterable, Optional
 from urllib.parse import unquote
 from pathlib import Path
 
+from wsprobe.oauth_refresh import jwt_exp_unix
+
 
 class CookieReadError(RuntimeError):
     def __init__(self, browser: str, attempts: list[str]):
@@ -32,7 +34,8 @@ def _parse_oauth2_cookie_value(raw: str) -> Optional[dict[str, Any]]:
 
 
 def oauth2_bundle_from_jar(jar: object) -> Optional[dict[str, Any]]:
-    """Return parsed _oauth2_access_v2 JSON (access_token, refresh_token, …) or None."""
+    """Return the freshest parsed _oauth2_access_v2 JSON or None."""
+    candidates: list[tuple[int, int, int, dict[str, Any]]] = []
     for cookie in jar:
         dom = (getattr(cookie, "domain", None) or "").lower()
         if "wealthsimple.com" not in dom:
@@ -43,9 +46,26 @@ def oauth2_bundle_from_jar(jar: object) -> Optional[dict[str, Any]]:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         data = _parse_oauth2_cookie_value(raw)
-        if data and data.get("access_token"):
-            return data
-    return None
+        if not data or not data.get("access_token"):
+            continue
+        created_at = data.get("created_at")
+        try:
+            created_score = int(created_at) if created_at is not None else 0
+        except (TypeError, ValueError):
+            created_score = 0
+        access = str(data.get("access_token") or "").strip()
+        jwt_exp = jwt_exp_unix(access) if access else None
+        exp_score = int(jwt_exp) if jwt_exp is not None else 0
+        cookie_exp = getattr(cookie, "expires", None)
+        try:
+            cookie_exp_score = int(cookie_exp) if cookie_exp is not None else 0
+        except (TypeError, ValueError):
+            cookie_exp_score = 0
+        candidates.append((created_score, exp_score, cookie_exp_score, data))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
+    return candidates[0][3]
 
 
 def _oauth_access_token_from_jar(jar: object) -> Optional[str]:
@@ -295,3 +315,55 @@ def oauth2_bundle_from_browser(browser: str) -> dict[str, Any]:
 def access_token_from_browser(browser: str) -> str:
     bundle = oauth2_bundle_from_browser(browser)
     return str(bundle["access_token"])
+
+
+def wealthsimple_request_context_first_available(
+    browsers: Iterable[str] | None = None,
+) -> dict[str, str]:
+    """
+    Return best-effort browser request context for wealthsimple.com:
+    browser name, cookie header value, and selected cookie values.
+    """
+    try:
+        loaders = _loaders()
+    except ImportError:
+        return {}
+    order = tuple(browsers) if browsers is not None else DEFAULT_TRY_BROWSERS
+    for name in order:
+        fn = loaders.get(name)
+        if fn is None:
+            continue
+        try:
+            jar = fn()
+        except Exception:
+            continue
+        cookie_pairs: list[tuple[str, str]] = []
+        selected: dict[str, str] = {}
+        for cookie in jar:
+            dom = (getattr(cookie, "domain", None) or "").lower()
+            if "wealthsimple.com" not in dom:
+                continue
+            cname = str(getattr(cookie, "name", "") or "")
+            cval_raw = getattr(cookie, "value", "")
+            cval = cval_raw.decode("utf-8", errors="replace") if isinstance(cval_raw, bytes) else str(cval_raw)
+            if not cname or not cval:
+                continue
+            cookie_pairs.append((cname, cval))
+            if cname in ("wssdi", "_cfuvid", "ws_global_visitor_id"):
+                selected[cname] = cval
+        if not cookie_pairs:
+            continue
+        # Preserve first-seen order while deduplicating by name.
+        seen: set[str] = set()
+        header_parts: list[str] = []
+        for cname, cval in cookie_pairs:
+            if cname in seen:
+                continue
+            seen.add(cname)
+            header_parts.append(f"{cname}={cval}")
+        if not header_parts:
+            continue
+        out = {"browser": name, "cookie_header": "; ".join(header_parts)}
+        out.update(selected)
+        return out
+    return {}

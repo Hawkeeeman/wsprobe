@@ -13,6 +13,7 @@ from wsprobe.oauth_refresh import (
     access_token_needs_refresh,
     refresh_access_token,
 )
+from wsprobe.browser_cookies import oauth2_bundle_first_available
 
 CONFIG_DIR = Path.home() / ".config" / "wsprobe"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -33,6 +34,19 @@ def _merge_refresh_response(bundle: dict[str, Any], new_tok: dict[str, Any]) -> 
     if new_tok.get("created_at") is not None:
         out["created_at"] = new_tok["created_at"]
     return out
+
+
+def _maybe_use_browser_oauth_bundle(bundle: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        browser_bundle, _browser_name = oauth2_bundle_first_available()
+    except SystemExit:
+        return None
+    access = str(browser_bundle.get("access_token") or "").strip()
+    if not access:
+        return None
+    if access_token_needs_refresh(access):
+        return None
+    return _merge_refresh_response(bundle, browser_bundle)
 
 
 def _persist_bundle(path: Path, bundle: dict[str, Any]) -> None:
@@ -90,6 +104,11 @@ def ensure_fresh_access_token(
         return access_s
 
     if not refresh_s:
+        browser_merged = _maybe_use_browser_oauth_bundle(bundle)
+        if browser_merged is not None:
+            if persist_path is not None:
+                _persist_bundle(persist_path, browser_merged)
+            return str(browser_merged["access_token"])
         raise SystemExit(
             "Access token is expired or near expiry and no refresh_token is available. "
             "Run wsprobe onboard again, or add refresh_token to your token file / "
@@ -102,9 +121,24 @@ def ensure_fresh_access_token(
     if env_cid:
         client_id = env_cid
 
+    browser_merged = _maybe_use_browser_oauth_bundle(bundle)
+    if browser_merged is not None:
+        if persist_path is not None:
+            _persist_bundle(persist_path, browser_merged)
+        return str(browser_merged["access_token"])
+
     try:
-        new_tok = refresh_access_token(refresh_s, client_id=client_id)
+        new_tok = refresh_access_token(
+            refresh_s,
+            client_id=client_id,
+            access_token=access_s,
+        )
     except RuntimeError as e:
+        browser_merged = _maybe_use_browser_oauth_bundle(bundle)
+        if browser_merged is not None:
+            if persist_path is not None:
+                _persist_bundle(persist_path, browser_merged)
+            return str(browser_merged["access_token"])
         raise SystemExit(
             "Access token expired and refresh failed. "
             "Log in at https://my.wealthsimple.com again (or set fresh "
