@@ -1859,10 +1859,15 @@ def cmd_onboard(args: argparse.Namespace) -> int:
     )
     cmd_export_session_snippet(args)
     print(
-        "\n\nStep 3: paste the console output JSON below, then press Ctrl-D:\n",
+        "\n\nStep 3: paste the console output JSON below, then press Enter:\n",
         file=sys.stderr,
     )
-    raw = sys.stdin.read()
+    raw = ""
+    while not raw.strip():
+        try:
+            raw = input()
+        except EOFError as e:
+            raise SystemExit("No JSON received. Paste the console output JSON, then press Enter.") from e
     data = _bundle_from_pasted_text(raw)
     _reject_expired_imported_access_token(data)
     _persist_bundle(SESSION_FILE, data)
