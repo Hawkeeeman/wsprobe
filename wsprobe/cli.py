@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -46,8 +48,9 @@ from wsprobe.queries import (
 )
 
 _PACKAGE_DIR = str(Path(__file__).resolve().parent)
-_REFRESH_HISTORY_FILE = CONFIG_DIR / "refresh_history.jsonl"
+_LOG_FILE = CONFIG_DIR / "logs.jsonl"
 _BUY_HISTORY_FILE = CONFIG_DIR / "buy_history.jsonl"
+_SESSION_ID = uuid.uuid4().hex[:12]
 
 
 def _token_fingerprint(token: str | None) -> str | None:
@@ -57,21 +60,60 @@ def _token_fingerprint(token: str | None) -> str | None:
     return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:12]
 
 
-def _append_refresh_history(entry: dict[str, Any]) -> None:
+def _mask_secret_value(value: str) -> str:
+    s = value.strip()
+    if not s:
+        return s
+    if len(s) <= 8:
+        return "*" * len(s)
+    return f"{s[:4]}...{s[-4:]}"
+
+
+def _sanitize_for_log(value: Any, *, key_hint: str | None = None) -> Any:
+    key = (key_hint or "").lower()
+    secret_key = any(
+        token in key
+        for token in (
+            "token",
+            "authorization",
+            "cookie",
+            "secret",
+            "password",
+            "api_key",
+            "apikey",
+        )
+    )
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_log(v, key_hint=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_log(v, key_hint=key_hint) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_log(v, key_hint=key_hint) for v in value]
+    if value is None:
+        return None
+    if secret_key:
+        return _mask_secret_value(str(value))
+    return value
+
+
+def _append_log(entry: dict[str, Any]) -> None:
     payload = dict(entry)
     payload.setdefault("ts_utc", datetime.now(timezone.utc).isoformat())
+    payload.setdefault("session_id", _SESSION_ID)
+    payload.setdefault("level", "info")
+    payload = _sanitize_for_log(payload)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with _REFRESH_HISTORY_FILE.open("a", encoding="utf-8") as fh:
+    with _LOG_FILE.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
         fh.write("\n")
 
 
-def _read_refresh_history(limit: int) -> list[dict[str, Any]]:
+def _read_logs(limit: int) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
-    if not _REFRESH_HISTORY_FILE.is_file():
+    if not _LOG_FILE.is_file():
         return []
-    lines = _REFRESH_HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    lines = _LOG_FILE.read_text(encoding="utf-8").splitlines()
     out: list[dict[str, Any]] = []
     for ln in lines:
         s = ln.strip()
@@ -95,6 +137,16 @@ def _append_buy_history(entry: dict[str, Any]) -> None:
     with _BUY_HISTORY_FILE.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
         fh.write("\n")
+    _append_log(
+        {
+            "event": "buy_history_append",
+            "level": "info",
+            "status": str(payload.get("status") or "unknown"),
+            "symbol": payload.get("symbol"),
+            "account_id": payload.get("account_id"),
+            "order_id": payload.get("order_id"),
+        }
+    )
 
 
 def _read_buy_history(limit: int) -> list[dict[str, Any]]:
@@ -122,16 +174,59 @@ def _read_buy_history(limit: int) -> list[dict[str, Any]]:
 def cmd_history(args: argparse.Namespace) -> int:
     from wsprobe import trade_service as ts
 
+    if bool(getattr(args, "clear", False)):
+        path = _BUY_HISTORY_FILE
+        deleted = False
+        missing = False
+        if path.is_file():
+            path.unlink()
+            deleted = True
+        else:
+            missing = True
+        if args.json:
+            print(format_json({"deleted": [str(path)] if deleted else [], "missing": [str(path)] if missing else []}))
+            return 0
+        if deleted:
+            print("deleted:")
+            print(f"  {path}")
+        if missing:
+            print("already empty:")
+            print(f"  {path}")
+        return 0
+
     limit = max(1, int(args.limit))
-    rows = _read_buy_history(limit)
+    rows = _read_buy_history(limit * 10)
+    symbol_filter = str(getattr(args, "symbol", "") or "").strip().upper()
+    status_filter = str(getattr(args, "status", "") or "").strip().lower()
+    account_filter = str(getattr(args, "account_id", "") or "").strip()
+    since_seconds = _parse_since_seconds(str(getattr(args, "since", "") or "").strip())
+    cutoff = (time.time() - since_seconds) if since_seconds is not None else None
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        sym = str(row.get("symbol") or "").strip().upper()
+        st = str(row.get("status") or "").strip().lower()
+        aid = str(row.get("account_id") or "").strip()
+        if symbol_filter and sym != symbol_filter:
+            continue
+        if status_filter and st != status_filter:
+            continue
+        if account_filter and aid != account_filter:
+            continue
+        if cutoff is not None:
+            ts_unix = _iso_to_unix(str(row.get("ts_utc") or ""))
+            if ts_unix is None or ts_unix < cutoff:
+                continue
+        filtered.append(row)
+    if len(filtered) > limit:
+        filtered = filtered[-limit:]
     if args.json:
-        print(format_json({"path": str(_BUY_HISTORY_FILE), "entries": rows}))
+        print(format_json({"path": str(_BUY_HISTORY_FILE), "entries": filtered}))
         return 0
     print(f"buy history path: {_BUY_HISTORY_FILE}")
-    if not rows:
+    if not filtered:
         print("no buy history entries yet")
         return 0
-    for row in rows:
+    for row in filtered:
         ts_utc = str(row.get("ts_utc") or "unknown-time")
         status = str(row.get("status") or "unknown")
         symbol = str(row.get("symbol") or "—")
@@ -164,25 +259,70 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "clear", False)):
+        deleted: list[str] = []
+        missing: list[str] = []
+        if _LOG_FILE.is_file():
+            _LOG_FILE.unlink()
+            deleted.append(str(_LOG_FILE))
+        else:
+            missing.append(str(_LOG_FILE))
+        if args.json:
+            print(format_json({"deleted": deleted, "missing": missing}))
+            return 0
+        if deleted:
+            print("deleted:")
+            for item in deleted:
+                print(f"  {item}")
+        if missing:
+            print("already empty:")
+            for item in missing:
+                print(f"  {item}")
+        return 0
+
     limit = max(1, int(args.limit))
-    rows = _read_refresh_history(limit)
-    if args.json:
-        print(format_json({"path": str(_REFRESH_HISTORY_FILE), "entries": rows}))
-        return 0
-    print(f"refresh log path: {_REFRESH_HISTORY_FILE}")
-    if not rows:
-        print("no refresh history entries yet")
-        return 0
+    rows = _read_logs(limit * 10)
+    level_filter = str(getattr(args, "level", "") or "").strip().lower()
+    event_filter = str(getattr(args, "event", "") or "").strip()
+    since_seconds = _parse_since_seconds(str(getattr(args, "since", "") or "").strip())
+    if since_seconds is not None:
+        cutoff = time.time() - since_seconds
+    else:
+        cutoff = None
+
+    filtered: list[dict[str, Any]] = []
     for row in rows:
+        if level_filter and str(row.get("level") or "").lower() != level_filter:
+            continue
+        if event_filter and not fnmatch.fnmatch(str(row.get("event") or ""), event_filter):
+            continue
+        if cutoff is not None:
+            ts = _iso_to_unix(str(row.get("ts_utc") or ""))
+            if ts is None or ts < cutoff:
+                continue
+        filtered.append(row)
+    if len(filtered) > limit:
+        filtered = filtered[-limit:]
+
+    if args.json:
+        print(format_json({"path": str(_LOG_FILE), "entries": filtered}))
+        return 0
+    print(f"log path: {_LOG_FILE}")
+    if not filtered:
+        print("no log entries yet")
+        return 0
+    for row in filtered:
         ts = str(row.get("ts_utc") or "unknown-time")
         event = str(row.get("event") or "event")
+        level = str(row.get("level") or "info")
+        session = str(row.get("session_id") or "-")
         cycle = row.get("cycle")
         cycle_txt = f" cycle={cycle}" if cycle is not None else ""
         action = row.get("action")
         action_txt = f" action={action}" if action else ""
         status = row.get("status")
         status_txt = f" status={status}" if status else ""
-        print(f"{ts}  {event}{cycle_txt}{action_txt}{status_txt}")
+        print(f"{ts}  {event} level={level} session={session}{cycle_txt}{action_txt}{status_txt}")
         tb = row.get("token_before_fp")
         ta = row.get("token_after_fp")
         if tb or ta:
@@ -196,6 +336,51 @@ def cmd_logs(args: argparse.Namespace) -> int:
         if msg:
             print(f"  note={msg}")
     return 0
+
+
+def _iso_to_unix(value: str) -> float | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _parse_since_seconds(value: str) -> int | None:
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    m = re.fullmatch(r"(\d+)([smhd])", text)
+    if not m:
+        raise SystemExit("--since must look like 30m, 2h, 1d, or 45s")
+    qty = int(m.group(1))
+    unit = m.group(2)
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return qty * mult
+
+
+def _append_refresh_history(entry: dict[str, Any]) -> None:
+    _append_log(entry)
+
+
+def _append_operational_log(
+    *,
+    event: str,
+    level: str = "info",
+    status: str | None = None,
+    message: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {"event": event, "level": level}
+    if status:
+        payload["status"] = status
+    if message:
+        payload["message"] = message
+    if details:
+        payload.update(details)
+    _append_log(payload)
 
 
 def _cli_invocation_name() -> str:
@@ -1556,120 +1741,6 @@ def cmd_lookup(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_doctor(args: argparse.Namespace) -> int:
-    import os as _os
-
-    report: dict[str, Any] = {
-        "wsprobe_version": __version__,
-        "wprobe_no_refresh": _os.environ.get("WSPROBE_NO_REFRESH", "").strip().lower() in ("1", "true", "yes"),
-    }
-    try:
-        bundle, persist, src = load_oauth_bundle(args)
-    except SystemExit as e:
-        report["ok"] = False
-        report["credentials"] = {"error": str(e)}
-        if args.json:
-            print(format_json(report))
-        else:
-            print("wsprobe doctor", file=sys.stderr)
-            print("  Credentials: failed —", e, file=sys.stderr)
-        return 1
-
-    path_label = str(persist) if persist is not None else None
-    report["credentials"] = {
-        "source": src,
-        "persist_path": path_label,
-        "has_refresh_token": bool((bundle.get("refresh_token") or "").strip()),
-    }
-    acc = str(bundle.get("access_token") or "")
-    report["access_token"] = _access_token_brief(acc)
-
-    token = _ensure_token(
-        bundle,
-        persist,
-        force_refresh=False,
-    )
-    sub = identity_id_for_graphql(token, bundle)
-    if not sub:
-        report["ok"] = False
-        report["graphql_identity"] = {
-            "ok": False,
-            "detail": "Could not read identity id from token (expired, malformed, or missing claims).",
-        }
-        if args.json:
-            print(format_json(report))
-        else:
-            _print_doctor_text(report, ok=False)
-        return 1
-
-    st, pl, raw = graphql_request(
-        access_token=token,
-        operation_name="FetchIdentityPackages",
-        query=FETCH_IDENTITY_PACKAGES,
-        variables={"id": sub},
-        oauth_bundle=bundle,
-    )
-    if st == 401 and bundle.get("refresh_token"):
-        token = _ensure_token(
-            bundle,
-            persist,
-            force_refresh=True,
-        )
-        st, pl, raw = graphql_request(
-            access_token=token,
-            operation_name="FetchIdentityPackages",
-            query=FETCH_IDENTITY_PACKAGES,
-            variables={"id": sub},
-            oauth_bundle=bundle,
-        )
-
-    gq_ok = st == 200 and isinstance(pl, dict) and not pl.get("errors")
-    report["graphql_identity"] = {
-        "ok": gq_ok,
-        "http_status": st,
-        "graphql_errors": pl.get("errors") if isinstance(pl, dict) else None,
-    }
-    if raw:
-        report["graphql_identity"]["raw"] = raw
-    report["ok"] = bool(gq_ok)
-
-    if args.json:
-        print(format_json(report))
-    else:
-        _print_doctor_text(report, ok=bool(gq_ok))
-    return 0 if gq_ok else 1
-
-
-def _print_doctor_text(report: dict[str, Any], *, ok: bool) -> None:
-    print("wsprobe doctor", file=sys.stderr)
-    cred = report.get("credentials") or {}
-    if cred.get("error"):
-        print("  Credentials: failed —", cred["error"], file=sys.stderr)
-        return
-    print("  Credentials: ok —", cred.get("source"), file=sys.stderr)
-    if cred.get("persist_path"):
-        print("  Save tokens to:     ", cred["persist_path"], file=sys.stderr)
-    print("  refresh_token:      ", "yes" if cred.get("has_refresh_token") else "no", file=sys.stderr)
-    at = report.get("access_token") or {}
-    if at.get("expires_at_utc"):
-        print("  access JWT expires:", at["expires_at_utc"], file=sys.stderr)
-    elif at:
-        print("  access JWT:         (no exp claim in token)", file=sys.stderr)
-    if at.get("needs_refresh_soon"):
-        print("  note:              token is expired or expiring (refresh was applied if available)", file=sys.stderr)
-    gq = report.get("graphql_identity") or {}
-    if gq.get("ok"):
-        print("  GraphQL identity:   HTTP 200, no errors", file=sys.stderr)
-    else:
-        print("  GraphQL identity:   failed (HTTP", gq.get("http_status"), ")", file=sys.stderr)
-        if gq.get("graphql_errors"):
-            print(format_json(gq["graphql_errors"]), file=sys.stderr)
-    print(
-        "All checks passed." if ok else "One or more checks failed.",
-        file=sys.stderr,
-    )
-
-
 def cmd_export_session_snippet(args: argparse.Namespace) -> int:
     """Print JS for pasting into DevTools on my.wealthsimple.com to build session.json."""
     print(
@@ -1806,16 +1877,13 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         epilog=(
             "Easiest flow:\n"
             "  1) pip install (see install-wsprobe.sh in repo)\n"
-            "  2) Run:  wsprobe onboard\n"
+            "  2) Run:  wsprobe setup\n"
             "  3) Paste snippet in browser console, then paste JSON back into terminal\n"
             "  4) Run:  wsp   or  wsprobe   (after  pip install -e .  in this project)\n"
             "\n"
             "More:\n"
-            "  %(prog)s easy              same as bare %(prog)s\n"
-            "  %(prog)s snippet           print snippet, wait for pasted JSON, save session\n"
-            "  %(prog)s onboard           guided one-time credential import flow\n"
+            "  %(prog)s setup             print snippet, wait for pasted JSON, save session\n"
             "  %(prog)s lookup AAPL        resolve ticker/search text → security ids (sec-s-…)\n"
-            "  %(prog)s doctor             credentials + GraphQL health (try this if auth fails)\n"
             "  %(prog)s accounts            Trade accounts (ids, TFSA/RRSP, buying power)\n"
             "  %(prog)s portfolio           all accounts: cash + holdings\n"
             "  %(prog)s funding             read-only funding/account cash view\n"
@@ -1824,11 +1892,9 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
             "  %(prog)s buy X --shares 1 --account-type tfsa --account-index 1 --confirm   real market buy\n"
             "  %(prog)s buy X --dollars 100 --account-type tfsa --account-index 1 --confirm real market buy by amount\n"
             "  %(prog)s sell --symbol X --shares 1 --account-type tfsa --account-index 1 --confirm  real market sell\n"
-            "  %(prog)s export-session-snippet     print JS: paste on my.wealthsimple.com → session.json\n"
             "  %(prog)s session-path               print where session.json lives (~/.config/wsprobe/)\n"
             "  %(prog)s import-session tokens.json   save tokens to session.json (or stdin)\n"
             "  %(prog)s keepalive                 background-friendly token refresh loop\n"
-            "  %(prog)s --access-token \"$JWT\" ping   use this JWT instead of browser/session file\n"
             "  export WEALTHSIMPLE_OAUTH_JSON='{\"access_token\":\"…\",\"refresh_token\":\"…\"}'   env bundle\n"
         ),
     )
@@ -1869,25 +1935,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
 
     sp = sub.add_parser(
-        "easy",
-        help="Connectivity check using saved/env credentials (default if you type nothing)",
-    )
-    sp.set_defaults(func=cmd_easy)
-
-    sp = sub.add_parser(
-        "onboard",
-        help="Guided setup: paste console snippet output and save credentials",
-    )
-    sp.add_argument(
-        "--auto-keepalive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Start keepalive in background after saving credentials (default: on)",
-    )
-    sp.set_defaults(func=cmd_onboard)
-
-    sp = sub.add_parser(
-        "snippet",
+        "setup",
         help="Print snippet, then wait for pasted JSON and save credentials",
     )
     sp.add_argument(
@@ -1897,12 +1945,6 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         help="Start keepalive in background after saving credentials (default: on)",
     )
     sp.set_defaults(func=cmd_snippet)
-
-    sp = sub.add_parser(
-        "ping",
-        help="Connectivity check (identity packages)",
-    )
-    sp.set_defaults(func=cmd_ping)
 
     sp = sub.add_parser(
         "keepalive",
@@ -1966,14 +2008,37 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "logs",
-        help="Show local keepalive refresh history (read-only)",
+        help="Show operational wsprobe logs",
     )
     sp.add_argument(
         "--limit",
         type=int,
         default=50,
         metavar="N",
-        help="Show the last N history rows (default: 50)",
+        help="Show the last N log rows (default: 50)",
+    )
+    sp.add_argument(
+        "--level",
+        choices=("info", "warn", "error"),
+        default=None,
+        help="Filter by log level",
+    )
+    sp.add_argument(
+        "--event",
+        default=None,
+        metavar="GLOB",
+        help="Filter by event name pattern (example: auth_*)",
+    )
+    sp.add_argument(
+        "--since",
+        default=None,
+        metavar="SPAN",
+        help="Filter by age (example: 30m, 2h, 1d)",
+    )
+    sp.add_argument(
+        "--clear",
+        action="store_true",
+        help="Delete the log file and exit",
     )
     sp.set_defaults(func=cmd_logs)
 
@@ -1987,6 +2052,35 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         default=50,
         metavar="N",
         help="Show the last N buy history rows (default: 50)",
+    )
+    sp.add_argument(
+        "--symbol",
+        default=None,
+        metavar="TICKER",
+        help="Filter by symbol (example: AAPL)",
+    )
+    sp.add_argument(
+        "--status",
+        default=None,
+        metavar="STATUS",
+        help="Filter by status (example: filled, submitted, failed)",
+    )
+    sp.add_argument(
+        "--account-id",
+        default=None,
+        metavar="ID",
+        help="Filter by account id",
+    )
+    sp.add_argument(
+        "--since",
+        default=None,
+        metavar="SPAN",
+        help="Filter by age (example: 30m, 2h, 1d)",
+    )
+    sp.add_argument(
+        "--clear",
+        action="store_true",
+        help="Delete the history file and exit",
     )
     sp.set_defaults(func=cmd_history)
 
@@ -2007,15 +2101,6 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         help="max rows to show (default: 20, max: 50)",
     )
     sp.set_defaults(func=cmd_lookup)
-
-    sp = sub.add_parser(
-        "doctor",
-        help="Check credentials, token expiry hint, and GraphQL identity query",
-    )
-    sp.set_defaults(func=cmd_doctor)
-
-    sp = sub.add_parser("status", help="Same as doctor")
-    sp.set_defaults(func=cmd_doctor)
 
     sp = sub.add_parser(
         "security",
@@ -2305,19 +2390,11 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=cmd_import_session)
 
-    sp = sub.add_parser(
-        "export-session-snippet",
-        help="Print console script: paste on my.wealthsimple.com to emit ~/.config/wsprobe/session.json",
-    )
-    sp.set_defaults(func=cmd_export_session_snippet)
-
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    if not argv:
-        argv = ["easy"]
 
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2326,7 +2403,58 @@ def main(argv: list[str] | None = None) -> int:
         args.command = "easy"
         args.func = cmd_easy
 
-    return int(args.func(args))
+    cmd_name = str(args.command or "easy")
+    started = time.time()
+    should_log_command = cmd_name not in {"clear-logs", "logs"}
+    if should_log_command:
+        _append_operational_log(
+            event="command_start",
+            details={
+                "command": cmd_name,
+                "argv": argv,
+                "pid": os.getpid(),
+            },
+        )
+    try:
+        code = int(args.func(args))
+    except KeyboardInterrupt:
+        if should_log_command:
+            _append_operational_log(
+                event="command_end",
+                level="warn",
+                status="interrupted",
+                details={
+                    "command": cmd_name,
+                    "exit_code": 130,
+                    "duration_ms": int((time.time() - started) * 1000),
+                },
+            )
+        raise
+    except Exception as e:
+        if should_log_command:
+            _append_operational_log(
+                event="command_end",
+                level="error",
+                status="error",
+                message=f"{type(e).__name__}: {e}",
+                details={
+                    "command": cmd_name,
+                    "duration_ms": int((time.time() - started) * 1000),
+                },
+            )
+        raise
+    if should_log_command:
+        _append_operational_log(
+            event="command_end",
+            status="ok" if code == 0 else "error",
+            level="info" if code == 0 else "error",
+            details={
+                "command": cmd_name,
+                "exit_code": code,
+                "duration_ms": int((time.time() - started) * 1000),
+            },
+        )
+    return code
 
 
 if __name__ == "__main__":
