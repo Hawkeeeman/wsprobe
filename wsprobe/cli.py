@@ -973,11 +973,23 @@ def _resolve_security_id_from_query(args: argparse.Namespace, query_text: str) -
     if not q:
         raise SystemExit("security_id is required (expected sec-s-... or a ticker like GOOG)")
 
+    # Parse exchange filter from prefix (TSX:AAPL) or suffix (AAPL.TO)
+    exchange_filter = None
+    search_q = q
+    if ":" in q:
+        parts = q.split(":", 1)
+        if len(parts) == 2:
+            exchange_filter = parts[0].strip().upper()
+            search_q = parts[1].strip()
+    elif q.upper().endswith(".TO"):
+        exchange_filter = "TSX"
+        search_q = q[:-3]
+
     status, payload, raw = _graphql_query_with_auth_retry(
         args,
         operation_name="FetchSecuritySearchResult",
         query=FETCH_SECURITY_SEARCH,
-        variables={"query": q},
+        variables={"query": search_q},
     )
     if raw:
         raise SystemExit(raw)
@@ -991,7 +1003,20 @@ def _resolve_security_id_from_query(args: argparse.Namespace, query_text: str) -
     if not isinstance(results, list) or not results:
         raise SystemExit(f"No security found for '{q}'.")
 
-    q_upper = q.upper()
+    # Filter by exchange if specified
+    if exchange_filter:
+        filtered = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            stock = item.get("stock") if isinstance(item.get("stock"), dict) else {}
+            exchange = (stock.get("primaryExchange") or "").strip().upper()
+            if exchange_filter in exchange:
+                filtered.append(item)
+        if filtered:
+            results = filtered
+
+    q_upper = search_q.upper()
     exact_symbol = None
     for item in results:
         if not isinstance(item, dict):
@@ -1498,6 +1523,7 @@ def cmd_buy(args: argparse.Namespace) -> int:
                 "symbol": symbol,
                 "requested_shares": shares,
                 "requested_value": dollars,
+                "limit_price": float(args.limit_price) if args.limit_price is not None else None,
             }
         )
         return ts.place_market_buy(
@@ -1506,6 +1532,7 @@ def cmd_buy(args: argparse.Namespace) -> int:
             security_id=security_id,
             quantity=shares,
             value=dollars,
+            limit_price=float(args.limit_price) if args.limit_price is not None else None,
         )
 
     try:
@@ -1591,6 +1618,7 @@ def cmd_sell(args: argparse.Namespace) -> int:
             account_id=account_id,
             security_id=security_id,
             quantity=float(args.shares),
+            limit_price=float(args.limit_price) if args.limit_price is not None else None,
         )
 
     try:
@@ -2223,7 +2251,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         dest="buy_symbol",
         default=None,
         metavar="TICKER",
-        help="Ticker (e.g. VFV.TO); resolved via Trade search",
+        help="Ticker (e.g. VFV.TO). Supports exchange filtering: TSX:AAPL or AAPL.TO for Canadian listings.",
     )
     sp.add_argument(
         "--security-id",
@@ -2273,6 +2301,13 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Required to actually submit the order (safety latch)",
     )
+    sp.add_argument(
+        "--limit-price",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Limit price per share (for limit orders; requires whole shares only)",
+    )
     sp.set_defaults(func=cmd_buy)
 
     sp = sub.add_parser(
@@ -2291,7 +2326,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         dest="sell_symbol",
         default=None,
         metavar="TICKER",
-        help="Ticker (e.g. VFV.TO); resolved via Trade search",
+        help="Ticker (e.g. VFV.TO). Supports exchange filtering: TSX:AAPL or AAPL.TO for Canadian listings.",
     )
     sp.add_argument(
         "--security-id",
@@ -2333,6 +2368,13 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         "--confirm",
         action="store_true",
         help="Required to actually submit the order (safety latch)",
+    )
+    sp.add_argument(
+        "--limit-price",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Limit price per share (for limit orders)",
     )
     sp.set_defaults(func=cmd_sell)
 
