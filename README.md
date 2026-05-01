@@ -1,0 +1,1 @@
+wsli - Wealthsimple CLI (npm)
