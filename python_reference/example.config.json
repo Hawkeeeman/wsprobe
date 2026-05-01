@@ -1,0 +1,4 @@
+{
+  "access_token": "paste_bearer_token_from_session_here",
+  "refresh_token": "optional_paste_refresh_token_for_auto_refresh"
+}
