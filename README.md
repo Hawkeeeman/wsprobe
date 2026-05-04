@@ -1,69 +1,54 @@
-# wsprobe
+# wsli
 
-Local CLI and optional web UI for Wealthsimple: read-only GraphQL, Trade REST for accounts/portfolio, and optional direct market buys (same OAuth session).
+Wealthsimple CLI (Node.js): read-only GraphQL, Trade REST for accounts / positions / portfolio / funding, read-only `preview-buy`, and real market **buy** / **sell** with `--confirm`.
 
-## npm CLI (`wsli`)
+## Requirements
 
-This repo now includes an npm-native CLI in `wsli/`.
+- [Node.js](https://nodejs.org/) 20+
+
+## Install
+
+From a clone of this repo:
 
 ```bash
-cd wsli
 npm install
 npm run build
 node dist/index.js --help
 ```
 
-Core commands currently available in `wsli`:
-- `setup`, `onboard`, `snippet`, `config-path`, `session-path`, `import-session`
-- `logs`, `history` (JSONL-backed local telemetry/history with filters and `--clear`)
-- `ping`, `keepalive`, `lookup`, `security`, `restrictions`, `preview-buy`
-- `accounts`, `positions`, `portfolio`, `funding`
-- `buy`, `sell` (both require `--confirm`)
+This repo includes an executable **`wsli`** launcher at the root (runs `node dist/index.js`). If `~/work/wsprobe` is on your `PATH`, the bare command `wsli` works after a new shell (or `source ~/.zshrc`).
 
-## Install
+**`zsh: command not found: wsli`** — until the repo is on `PATH`, from this directory use any of:
 
 ```bash
-pip install -e .
+node dist/index.js ping --json
+npm run wsli -- ping --json
+npm exec wsli -- ping --json
 ```
 
-Use the same Python (or a venv) for `pip` and when you run `wsprobe`, so the console script and the package stay in sync.
+To use the bare `wsli` command: `npm link` in the repo root, then put npm’s global bin on your `PATH` (often `$(npm prefix -g)/bin`; check with `npm prefix -g`). Or: `npm install -g .` from the repo, or `npm install -g wsli` once published.
 
-**If `wsprobe setup` is “invalid choice”** another `wsprobe` is earlier on your `PATH` than this project. This package also installs a **`wsp`** command (read-only GraphQL tool only) so you can run it without that conflict:
+## Credentials
+
+OAuth bundle is stored at **`~/.config/wsli/session.json`** (see `wsli session-path`).
+
+If you previously used the removed Python tool, **`~/.config/wsprobe/session.json`** is still read automatically when the wsli session file is missing.
+
+## Commands
+
+Run `node dist/index.js --help` (or `npm run wsli -- --help`) and the same with `<command> --help`.
+
+Core commands: `setup`, `onboard`, `snippet`, `config-path`, `session-path`, `import-session`, `ping`, `keepalive`, `lookup`, `security`, `restrictions`, `preview-buy`, `accounts`, `positions`, `portfolio`, `funding`, `buy`, `sell` (buy/sell require `--confirm`), `logs`, `history`.
+
+## Env / flags
+
+- `--token-file`, `--access-token`, `--refresh-token`, `--json`
+- `WEALTHSIMPLE_ACCESS_TOKEN`, `WEALTHSIMPLE_REFRESH_TOKEN`, `WEALTHSIMPLE_OAUTH_JSON`, `WEALTHSIMPLE_OAUTH_CLIENT_ID`
+- `WSLI_NO_REFRESH` or `WSPROBE_NO_REFRESH`: set to `1` / `true` to skip OAuth refresh
+
+## Develop
 
 ```bash
-wsp lookup AAPL
+npm run dev -- --help
+npm run check
 ```
-
-Or from this repo, `python3 -m wsprobe …` always uses this tree. After `pip install -e .`, run `wsp --version` to confirm the `package: …/wsprobe` path. Reinstall with the same `python3 -m pip` you use to run the tool so PATH scripts match.
-
-## Quick start
-
-```bash
-wsp setup
-wsp keepalive
-# or: python3 -m wsprobe
-```
-
-`wsp setup` prints a console snippet for `my.wealthsimple.com`, then waits for you to paste the snippet output back into the terminal and saves it to `~/.config/wsprobe/session.json`.
-
-After `wsp setup` (or `wsp import-session`), `wsprobe` now auto-starts `wsp keepalive` in the background by default (disable with `--no-auto-keepalive`).
-The background process writes logs to `~/.config/wsprobe/keepalive.log` and PID to `~/.config/wsprobe/keepalive.pid`.
-Structured refresh history is also saved to `~/.config/wsprobe/refresh_history.jsonl` and can be viewed with `wsp logs` (or `wsprobe logs`). Clear it with `wsp logs --clear`.
-Buy history is saved to `~/.config/wsprobe/buy_history.jsonl` for successful `buy` commands and can be viewed with `wsp history` (or `wsprobe history`). Clear it with `wsp history --clear`.
-
-`wsp keepalive` now uses an adaptive auth probe loop: token health is read from `/v1/oauth/v2/token/info`, probe cadence shifts between active and idle windows using `wsstg::lastActivityTime` and `wsstg::sessionInactivityTimeoutMinutes`, and refresh decisions are driven by live `expires_in` bands (prepare, refresh, and critical windows). Refresh attempts are verified by checking token rollover (`created_at` or a significant `expires_in` jump), with transient retry backoff before session degradation. If refresh still fails, it can recover from a logged-in browser session (disable with `--no-browser-recover`).
-`wsp logs --limit 100` is read-only and only prints history; it does not trigger network auth activity.
-
-## Local web UI
-
-```bash
-pip install -e '.[web]'
-wsprobe-serve
-```
-
-Then open `http://127.0.0.1:8765/`.
-
-## Notes
-
-- GraphQL mutations are blocked in `wsprobe/client.py`; market buys use Trade REST (`wsprobe buy`, see `--help`).
-- OAuth refresh is supported using `refresh_token` when available.

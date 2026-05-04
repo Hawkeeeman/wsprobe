@@ -1,15 +1,19 @@
 {
   "name": "wsli",
-  "version": "0.1.0",
-  "description": "NPM-native Wealthsimple CLI",
+  "version": "0.2.0",
+  "description": "Wealthsimple CLI: GraphQL + Trade REST (accounts, portfolio, buy/sell)",
   "license": "MIT",
   "type": "module",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "wsli": "./dist/index.js"
   },
   "scripts": {
     "prepare": "npm run build",
     "build": "tsc -p tsconfig.json",
+    "wsli": "node ./dist/index.js",
     "dev": "tsx src/index.ts",
     "check": "tsc --noEmit -p tsconfig.json"
   },

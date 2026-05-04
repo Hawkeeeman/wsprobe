@@ -1,8 +1,6 @@
 ---
-description: Trading repo — wsprobe, Wealthsimple read-only + preview flows
+description: Trading repo — wsli, Wealthsimple read-only + trade flows
 alwaysApply: true
 ---
 
-# Trading workspace
-
-Primary Python package is **`wsprobe/`** (CLI: `python3 -m wsprobe`): read-only Wealthsimple GraphQL in `client.py` (mutations blocked there); Trade REST in `trade_service.py` for `accounts`, `portfolio`, `positions`, and direct `buy` to trade-service. Optional local UI: `pip install -e '.[web]'` then `wsprobe-serve` (read-only). The repo also contains other bots, scripts, and sim code — prefer the smallest change that matches the user’s request.
+Primary CLI is **`wsli`** (Node, repo root: `npm install && npm run build`, bin `wsli` → `dist/index.js` (from `src/index.ts`)). Read-only Wealthsimple GraphQL and Trade REST at `trade-service.wealthsimple.com` for accounts, portfolio, positions, funding; market buy/sell require `--confirm`. Session defaults to `~/.config/wsli/session.json`; legacy `~/.config/wsprobe/session.json` is used if the wsli file is absent. The repo may contain other bots, scripts, and sim code — prefer the smallest change that matches the user’s request.

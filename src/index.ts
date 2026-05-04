@@ -7,7 +7,7 @@ import process from "node:process";
 import crypto from "node:crypto";
 import readline from "node:readline";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const GRAPHQL_URL = "https://my.wealthsimple.com/graphql";
 const TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com";
 const OAUTH_TOKEN_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token";
@@ -16,6 +16,9 @@ const DEFAULT_OAUTH_CLIENT_ID = "4da53ac2b03225bed1550eba8e4611e086c7b905a3855e6
 const CONFIG_DIR = path.join(os.homedir(), ".config", "wsli");
 const SESSION_FILE = path.join(CONFIG_DIR, "session.json");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+const LEGACY_CONFIG_DIR = path.join(os.homedir(), ".config", "wsprobe");
+const LEGACY_SESSION_FILE = path.join(LEGACY_CONFIG_DIR, "session.json");
+const LEGACY_CONFIG_FILE = path.join(LEGACY_CONFIG_DIR, "config.json");
 const LOG_FILE = path.join(CONFIG_DIR, "logs.jsonl");
 const BUY_HISTORY_FILE = path.join(CONFIG_DIR, "buy_history.jsonl");
 const DEFAULT_API_VERSION = "12";
@@ -429,8 +432,15 @@ async function resolveOAuthBundle(opts: GlobalOptions): Promise<OAuthBundle> {
   const sessionBundle = loadBundleFromPath(SESSION_FILE);
   if (sessionBundle) return sessionBundle;
 
+  const legacySession = loadBundleFromPath(LEGACY_SESSION_FILE);
+  if (legacySession) return legacySession;
+
+  const legacyConfig = loadBundleFromPath(LEGACY_CONFIG_FILE);
+  if (legacyConfig) return legacyConfig;
+
   throw new Error(
-    "No credentials found. Run wsli import-session <tokens.json> or set WEALTHSIMPLE_ACCESS_TOKEN."
+    "No credentials found. Run wsli setup or wsli import-session <tokens.json>, or set WEALTHSIMPLE_ACCESS_TOKEN. " +
+      `(New session file: ${SESSION_FILE}; legacy Python tool used ${LEGACY_SESSION_FILE}.)`
   );
 }
 
@@ -733,7 +743,9 @@ function withGlobalOptions(command: Command): Command {
 async function main(): Promise<void> {
   const program = withGlobalOptions(new Command())
     .name("wsli")
-    .description("NPM-native Wealthsimple CLI")
+    .description(
+      "Wealthsimple CLI: read-only GraphQL plus Trade REST (accounts, portfolio, funding, preview-buy, market buy/sell with --confirm)."
+    )
     .version(VERSION);
 
   program.command("config-path").action(() => {
