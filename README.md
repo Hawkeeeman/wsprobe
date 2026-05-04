@@ -2,6 +2,24 @@
 
 Local CLI and optional web UI for Wealthsimple: read-only GraphQL, Trade REST for accounts/portfolio, and optional direct market buys (same OAuth session).
 
+## npm CLI (`wsli`)
+
+This repo now includes an npm-native CLI in `wsli/`.
+
+```bash
+cd wsli
+npm install
+npm run build
+node dist/index.js --help
+```
+
+Core commands currently available in `wsli`:
+- `setup`, `onboard`, `snippet`, `config-path`, `session-path`, `import-session`
+- `logs`, `history` (JSONL-backed local telemetry/history with filters and `--clear`)
+- `ping`, `keepalive`, `lookup`, `security`, `restrictions`, `preview-buy`
+- `accounts`, `positions`, `portfolio`, `funding`
+- `buy`, `sell` (both require `--confirm`)
+
 ## Install
 
 ```bash

@@ -14,3 +14,7 @@ dist/
 logs/
 screenshot.png
 opera-screenshot.png
+
+# Node (wsli npm CLI)
+wsli/node_modules/
+wsli/dist/
