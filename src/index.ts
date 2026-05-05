@@ -341,17 +341,39 @@ function appendLog(entry: Record<string, unknown>): void {
 }
 
 function appendBuyHistory(entry: Record<string, unknown>): void {
+  const historyId = String(entry.history_id ?? "").trim() || `trd-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
   writeJsonl(BUY_HISTORY_FILE, {
     ts_utc: new Date().toISOString(),
+    history_id: historyId,
     ...entry
   });
   appendLog({
     event: "buy_history_append",
+    history_id: historyId,
     status: String(entry.status ?? "unknown"),
     symbol: entry.symbol,
     account_id: entry.account_id,
     order_id: entry.order_id
   });
+}
+
+function ensureHistoryIds(rows: Record<string, unknown>[]): { rows: Record<string, unknown>[]; updated: boolean } {
+  let updated = false;
+  const normalized = rows.map((row) => {
+    const existing = String(row.history_id ?? "").trim();
+    if (existing) return row;
+    updated = true;
+    return {
+      ...row,
+      history_id: `trd-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`
+    };
+  });
+  return { rows: normalized, updated };
+}
+
+function writeJsonlRows(filePath: string, rows: Record<string, unknown>[]): void {
+  const content = rows.map((row) => JSON.stringify(row)).join("\n");
+  writeFileSync(filePath, content ? `${content}\n` : "", "utf-8");
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
@@ -722,6 +744,130 @@ function globMatch(text: string, pattern: string): boolean {
   return new RegExp(`^${escaped}$`).test(text);
 }
 
+function formatMoney(value: number): string {
+  return `$${value.toFixed(2)}`;
+}
+
+function formatLocalTime(value: string): string {
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return value || "Unknown";
+  const local = new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(ts));
+  const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+    .formatToParts(new Date(ts))
+    .find((part) => part.type === "timeZoneName")?.value;
+  return zone ? `${local} ${zone}` : local;
+}
+
+function formatAge(value: string): string | null {
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return null;
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function titleCase(value: string): string {
+  if (!value) return "Unknown";
+  return value
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((part) => part[0].toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function displayStatus(value: string): string {
+  const clean = value.trim().toLowerCase();
+  if (!clean) return "Unknown";
+  if (clean === "new") return "Pending";
+  return titleCase(clean);
+}
+
+function accountTypeLabel(value: string): string {
+  const clean = value.trim().toLowerCase();
+  const map: Record<string, string> = {
+    ca_tfsa: "TFSA",
+    ca_rrsp: "RRSP",
+    ca_fhsa: "FHSA",
+    ca_resp: "RESP",
+    ca_joint: "Joint",
+    ca_non_registered: "Non-registered",
+    ca_rrif: "RRIF",
+    ca_lira: "LIRA",
+    ca_lrsp: "LRSP"
+  };
+  return map[clean] ?? titleCase(clean.replace(/^ca_/, "") || "account");
+}
+
+function buildAccountLabelMap(accounts: Record<string, unknown>[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const row of accounts) {
+    const id = String(row.id ?? "").trim();
+    if (!id) continue;
+    const type = accountTypeLabel(String(row.account_type ?? ""));
+    const nickname = String(row.nickname ?? "").trim();
+    const label = nickname ? `${type} (${nickname})` : type;
+    out.set(id, label);
+  }
+  return out;
+}
+
+function formatHistoryEntry(row: Record<string, unknown>, index: number, accountLabels: Map<string, string>): string {
+  const historyId = String(row.history_id ?? "").trim();
+  const side = String(row.side ?? "").trim().toLowerCase();
+  const orderStyle = String(row.order_style ?? "").trim();
+  const action = `${orderStyle ? `${titleCase(orderStyle)} ` : ""}${titleCase(side || "trade")}`.trim();
+  const symbol = String(row.symbol ?? "").trim().toUpperCase() || "Unknown";
+  const accountId = String(row.account_id ?? "").trim();
+  const account = accountLabels.get(accountId) ?? "Unknown";
+  const status = displayStatus(String(row.status ?? "unknown"));
+  const tsUtc = String(row.ts_utc ?? "");
+  const tsLabel = formatLocalTime(tsUtc);
+  const age = formatAge(tsUtc);
+  const submittedValue = Number(row.submitted_value);
+  const submittedQuantity = Number(row.submitted_quantity);
+  const averageFillPrice = Number(row.average_filled_price);
+  const filledQuantity = Number(row.filled_quantity);
+  const limitPrice = Number(row.limit_price);
+  const stopPrice = Number(row.stop_price);
+  const lines: string[] = [];
+  lines.push(`Trade ${index + 1}`);
+  if (historyId) lines.push(`ID: ${historyId}`);
+  lines.push(`Time: ${tsLabel}${age ? ` (${age})` : ""}`);
+  lines.push(`Action: ${action}`);
+  lines.push(`Stock: ${symbol}`);
+  lines.push(`Account: ${account}`);
+  if (Number.isFinite(submittedValue) && submittedValue > 0) {
+    lines.push(`Amount: ${formatMoney(submittedValue)}`);
+  } else if (Number.isFinite(submittedQuantity) && submittedQuantity > 0) {
+    lines.push(`Amount: ${submittedQuantity} ${submittedQuantity === 1 ? "share" : "shares"}`);
+  } else {
+    lines.push("Amount: Unknown");
+  }
+  if (Number.isFinite(limitPrice) && limitPrice > 0) lines.push(`Limit: ${formatMoney(limitPrice)}`);
+  if (Number.isFinite(stopPrice) && stopPrice > 0) lines.push(`Stop: ${formatMoney(stopPrice)}`);
+  lines.push(`Status: ${status}`);
+  if (Number.isFinite(filledQuantity) && filledQuantity > 0) {
+    const fillText = Number.isFinite(averageFillPrice) && averageFillPrice > 0
+      ? `${filledQuantity} @ ${formatMoney(averageFillPrice)}`
+      : `${filledQuantity}`;
+    lines.push(`Fill: ${fillText}`);
+  }
+  const rejection = String(row.rejection_message ?? row.rejection_cause ?? "").trim();
+  if (rejection) lines.push(`Reason: ${rejection}`);
+  return lines.join("\n");
+}
+
 async function listAccounts(token: string, bundle: OAuthBundle): Promise<Record<string, unknown>[]> {
   const identityId = identityIdFromToken(token) ?? (bundle.identity_canonical_id as string | undefined);
   if (!identityId) throw new Error("Could not resolve identity id from token.");
@@ -878,18 +1024,60 @@ function normalizeSecurityId(raw: string): string {
   throw new Error("Invalid security_id format. Expected sec-s-...");
 }
 
-async function resolveSecurityIdArg(token: string, bundle: OAuthBundle, raw: string): Promise<string> {
+function matchesExchange(primaryExchange: string, market: string): boolean {
+  const exchange = primaryExchange.trim().toUpperCase();
+  const wanted = market.trim().toUpperCase();
+  if (!exchange || !wanted) return false;
+  return exchange === wanted || exchange.includes(wanted) || wanted.includes(exchange);
+}
+
+function parseMarketQualifiedTicker(raw: string): { symbol: string; market?: string } {
+  const value = raw.trim();
+  const match = /^([A-Za-z]{2,10})\.([A-Za-z][A-Za-z0-9.-]{0,9})$/.exec(value);
+  if (!match) return { symbol: value };
+  return {
+    market: match[1].toUpperCase(),
+    symbol: match[2].toUpperCase()
+  };
+}
+
+async function resolveSecurityIdArg(token: string, bundle: OAuthBundle, raw: string, market?: string): Promise<string> {
   try {
     return normalizeSecurityId(raw);
   } catch {
     const payload = await graphqlRequest(token, "FetchSecuritySearchResult", FETCH_SECURITY_SEARCH, { query: raw }, bundle);
     const results = ((((payload.data as Record<string, unknown>)?.securitySearch as Record<string, unknown>)?.results) as Record<string, unknown>[] | undefined) ?? [];
     if (!results.length) throw new Error(`No security found for '${raw}'.`);
-    const exact = results.find((item) => {
+    const exactMatches = results.filter((item) => {
       const stock = item.stock as Record<string, unknown> | undefined;
       return String(stock?.symbol ?? "").toUpperCase() === raw.toUpperCase();
     });
+    const normalizedMarket = String(market ?? "").trim();
+    const exact = normalizedMarket
+      ? exactMatches.find((item) => {
+        const stock = item.stock as Record<string, unknown> | undefined;
+        const primaryExchange = String(stock?.primaryExchange ?? "");
+        return matchesExchange(primaryExchange, normalizedMarket);
+      })
+      : exactMatches[0];
     const looksLikeTicker = /^[A-Za-z][A-Za-z0-9.-]{0,9}$/.test(raw.trim());
+    if (looksLikeTicker && exactMatches.length > 1 && !normalizedMarket) {
+      const exchanges = exactMatches
+        .map((item) => {
+          const stock = item.stock as Record<string, unknown> | undefined;
+          return String(stock?.primaryExchange ?? "").trim();
+        })
+        .filter(Boolean)
+        .slice(0, 5)
+        .join(", ");
+      throw new Error(
+        `Ticker '${raw}' matches multiple markets (${exchanges || "unknown exchanges"}). ` +
+          "Pass --market (for example: TSX, NYSE, NASDAQ)."
+      );
+    }
+    if (looksLikeTicker && normalizedMarket && !exact) {
+      throw new Error(`No exact ticker match for '${raw}' on market '${normalizedMarket}'.`);
+    }
     if (!exact && looksLikeTicker) {
       const sample = results
         .slice(0, 5)
@@ -1628,6 +1816,7 @@ async function main(): Promise<void> {
     .argument("[target]", "Ticker or security id")
     .option("--symbol <ticker>")
     .option("--security-id <id>")
+    .option("--market <exchange>", "Required for ticker buys (example: TSX, NYSE, NASDAQ)")
     .option("--shares <n>")
     .option("--dollars <amount>")
     .option("--order <type>", "market, limit, stop_limit, or stop_market", "market")
@@ -1650,8 +1839,19 @@ async function main(): Promise<void> {
       );
       const symbol = String(cmdOpts.symbol ?? target ?? "").trim();
       const securityId = String(cmdOpts.securityId ?? "").trim();
+      const marketOption = String(cmdOpts.market ?? "").trim();
       if (!securityId && !symbol) throw new Error("Provide --security-id or ticker/symbol.");
-      const resolvedSecurityId = securityId || await resolveSecurityIdArg(token, bundle, symbol);
+      const parsed = parseMarketQualifiedTicker(symbol);
+      const requestedSymbol = parsed.symbol;
+      const qualifiedMarket = parsed.market;
+      if (qualifiedMarket && marketOption && qualifiedMarket.toUpperCase() !== marketOption.toUpperCase()) {
+        throw new Error(`Conflicting market values: '${qualifiedMarket}' in ticker and '--market ${marketOption}'.`);
+      }
+      const market = marketOption || qualifiedMarket || "";
+      if (!securityId && !market) {
+        throw new Error("Ticker buys require a market: use TSX.SHOP style or pass --market.");
+      }
+      const resolvedSecurityId = securityId || await resolveSecurityIdArg(token, bundle, requestedSymbol, market);
       const shares = cmdOpts.shares ? Number.parseFloat(String(cmdOpts.shares)) : undefined;
       const dollars = cmdOpts.dollars ? Number.parseFloat(String(cmdOpts.dollars)) : undefined;
       if ((shares === undefined) === (dollars === undefined)) {
@@ -1790,7 +1990,7 @@ async function main(): Promise<void> {
       appendBuyHistory({
         side: "buy",
         status: String(order.status ?? "unknown"),
-        symbol: symbol || null,
+        symbol: requestedSymbol || symbol || null,
         security_id: resolvedSecurityId,
         account_id: accountId,
         order_id: String(order.orderId ?? order.id ?? ""),
@@ -2114,13 +2314,28 @@ async function main(): Promise<void> {
 
   program
     .command("history")
-    .option("--limit <n>", "Show last N rows", "50")
+    .option("--limit <n>", "Show last N rows (default: all)")
     .option("--symbol <ticker>", "Filter by symbol")
     .option("--status <status>", "Filter by status")
     .option("--account-id <id>", "Filter by account id")
     .option("--since <span>", "Filter by age: 30m, 2h, 1d")
+    .option("--clear-last <n>", "Delete the last N trades")
+    .option("--clear-id <id>", "Delete one trade by history ID")
+    .option("--json", "Output raw JSON history entries")
     .option("--clear", "Delete history file")
-    .action((cmdOpts: { limit: string; symbol?: string; status?: string; accountId?: string; since?: string; clear?: boolean }) => {
+    .action(async (cmdOpts: {
+      limit: string;
+      symbol?: string;
+      status?: string;
+      accountId?: string;
+      since?: string;
+      clearLast?: string;
+      clearId?: string;
+      json?: boolean;
+      clear?: boolean;
+    }) => {
+      const clearModes = [cmdOpts.clear === true, Boolean(cmdOpts.clearLast), Boolean(cmdOpts.clearId)].filter(Boolean).length;
+      if (clearModes > 1) throw new Error("Use only one clear mode at a time: --clear, --clear-last, or --clear-id.");
       if (cmdOpts.clear) {
         if (existsSync(BUY_HISTORY_FILE)) {
           writeFileSync(BUY_HISTORY_FILE, "", "utf-8");
@@ -2130,8 +2345,44 @@ async function main(): Promise<void> {
         }
         return;
       }
-      const limit = Math.max(1, Number.parseInt(cmdOpts.limit, 10) || 50);
-      const rows = readJsonl(BUY_HISTORY_FILE, limit * 10);
+      if (cmdOpts.clearLast) {
+        const removeCount = Number.parseInt(cmdOpts.clearLast, 10);
+        if (!Number.isInteger(removeCount) || removeCount <= 0) {
+          throw new Error("--clear-last must be a positive integer.");
+        }
+        const ensured = ensureHistoryIds(readJsonl(BUY_HISTORY_FILE, Number.MAX_SAFE_INTEGER));
+        const rows = ensured.rows;
+        if (ensured.updated) writeJsonlRows(BUY_HISTORY_FILE, rows);
+        if (removeCount > rows.length) {
+          throw new Error(`Cannot clear last ${removeCount} trades; only ${rows.length} trades exist.`);
+        }
+        const keep = rows.slice(0, rows.length - removeCount);
+        writeJsonlRows(BUY_HISTORY_FILE, keep);
+        print({ cleared: removeCount, remaining: keep.length });
+        return;
+      }
+      if (cmdOpts.clearId) {
+        const targetId = cmdOpts.clearId.trim();
+        if (!targetId) throw new Error("--clear-id requires a non-empty ID.");
+        const ensured = ensureHistoryIds(readJsonl(BUY_HISTORY_FILE, Number.MAX_SAFE_INTEGER));
+        const rows = ensured.rows;
+        if (ensured.updated) writeJsonlRows(BUY_HISTORY_FILE, rows);
+        const keep = rows.filter((row) => String(row.history_id ?? "").trim() !== targetId);
+        if (keep.length === rows.length) {
+          throw new Error(`No trade found with history ID '${targetId}'.`);
+        }
+        writeJsonlRows(BUY_HISTORY_FILE, keep);
+        print({ cleared_id: targetId, remaining: keep.length });
+        return;
+      }
+      const parsedLimit = cmdOpts.limit !== undefined ? Number.parseInt(cmdOpts.limit, 10) : undefined;
+      if (parsedLimit !== undefined && (!Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
+        throw new Error("--limit must be a positive integer.");
+      }
+      const limit = parsedLimit;
+      const ensured = ensureHistoryIds(readJsonl(BUY_HISTORY_FILE, Number.MAX_SAFE_INTEGER));
+      const rows = ensured.rows;
+      if (ensured.updated) writeJsonlRows(BUY_HISTORY_FILE, rows);
       const symbol = (cmdOpts.symbol ?? "").trim().toUpperCase();
       const status = (cmdOpts.status ?? "").trim().toLowerCase();
       const accountId = (cmdOpts.accountId ?? "").trim();
@@ -2147,8 +2398,21 @@ async function main(): Promise<void> {
         }
         return true;
       });
-      const output = filtered.length > limit ? filtered.slice(-limit) : filtered;
-      print({ path: BUY_HISTORY_FILE, entries: output });
+      const output = limit !== undefined ? filtered.slice(-limit) : filtered;
+      if (cmdOpts.json) {
+        print({ path: BUY_HISTORY_FILE, entries: output });
+        return;
+      }
+      if (!output.length) {
+        console.log("No history entries found.");
+        return;
+      }
+      const opts = program.opts<GlobalOptions>();
+      const { token, bundle } = await resolveAccessToken(opts);
+      const accounts = await listAccounts(token, bundle);
+      const accountLabels = buildAccountLabelMap(accounts);
+      const blocks = output.map((row, index) => formatHistoryEntry(row, index, accountLabels));
+      console.log(blocks.join("\n\n"));
     });
 
   await program.parseAsync(process.argv);
