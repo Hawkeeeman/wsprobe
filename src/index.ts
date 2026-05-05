@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -12,12 +13,14 @@ const GRAPHQL_URL = "https://my.wealthsimple.com/graphql";
 const TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com";
 const OAUTH_TOKEN_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token";
 const OAUTH_TOKEN_INFO_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token/info";
+const SESSION_INFO_URL = "https://api.production.wealthsimple.com/api/sessions";
 const DEFAULT_OAUTH_CLIENT_ID = "4da53ac2b03225bed1550eba8e4611e086c7b905a3855e6ed12ea08c246758fa";
 const CONFIG_DIR = path.join(os.homedir(), ".config", "wsli");
 const SESSION_FILE = path.join(CONFIG_DIR, "session.json");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const LOG_FILE = path.join(CONFIG_DIR, "logs.jsonl");
 const BUY_HISTORY_FILE = path.join(CONFIG_DIR, "buy_history.jsonl");
+const KEEPALIVE_PID_FILE = path.join(CONFIG_DIR, "keepalive.pid");
 const DEFAULT_API_VERSION = "12";
 const SESSION_ID = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 
@@ -384,6 +387,114 @@ function identityIdFromToken(token: string): string | null {
   const identityId = payload.identity_id;
   if (typeof identityId === "string" && identityId.trim()) return identityId;
   return null;
+}
+
+function isProcessRunning(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function maybeStartKeepalive(bundle: OAuthBundle): void {
+  if (!bundle.refresh_token) return;
+  let existingPid = 0;
+  if (existsSync(KEEPALIVE_PID_FILE)) {
+    const raw = readFileSync(KEEPALIVE_PID_FILE, "utf-8").trim();
+    existingPid = Number.parseInt(raw, 10);
+  }
+  if (isProcessRunning(existingPid)) return;
+  const entryScript = process.argv[1];
+  if (!entryScript) return;
+  const child = spawn(process.execPath, [entryScript, "keepalive"], {
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
+  writeFileSync(KEEPALIVE_PID_FILE, `${child.pid}\n`, "utf-8");
+  appendLog({ event: "auth_keeper_autostart", status: "ok", pid: child.pid });
+}
+
+function keepaliveStatus(): "Active" | "Inactive" {
+  if (!existsSync(KEEPALIVE_PID_FILE)) return "Inactive";
+  const raw = readFileSync(KEEPALIVE_PID_FILE, "utf-8").trim();
+  const pid = Number.parseInt(raw, 10);
+  return isProcessRunning(pid) ? "Active" : "Inactive";
+}
+
+function readKeepalivePid(): number {
+  if (!existsSync(KEEPALIVE_PID_FILE)) return 0;
+  const raw = readFileSync(KEEPALIVE_PID_FILE, "utf-8").trim();
+  return Number.parseInt(raw, 10);
+}
+
+function writeKeepalivePid(pid: number): void {
+  writeFileSync(KEEPALIVE_PID_FILE, `${pid}\n`, "utf-8");
+}
+
+function clearKeepalivePidIfOwned(ownerPid: number): void {
+  const pid = readKeepalivePid();
+  if (pid !== ownerPid) return;
+  try {
+    unlinkSync(KEEPALIVE_PID_FILE);
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+function tokenFingerprint(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+
+function jitterDelayMs(baseMs: number): number {
+  const min = Math.max(1, Math.floor(baseMs * 0.8));
+  const max = Math.max(min, Math.ceil(baseMs * 1.2));
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getSessionInfo(accessToken: string): Promise<Record<string, unknown> | null> {
+  const response = await fetch(SESSION_INFO_URL, {
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${accessToken}`
+    }
+  });
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`session info HTTP ${response.status}: ${JSON.stringify(payload)}`);
+  }
+  return payload;
+}
+
+function extractActivityAgeSeconds(sessionInfo: Record<string, unknown>): number | null {
+  const now = Date.now() / 1000;
+  const candidateKeys = ["last_active_at", "last_activity_at", "last_seen_at", "updated_at", "created_at"];
+  for (const key of candidateKeys) {
+    const raw = sessionInfo[key];
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const parsed = Date.parse(raw);
+    if (!Number.isFinite(parsed)) continue;
+    return Math.max(0, now - parsed / 1000);
+  }
+  return null;
+}
+
+function extractIdleTimeoutSeconds(sessionInfo: Record<string, unknown>): number {
+  const candidateKeys = ["idle_timeout_seconds", "idle_timeout_s", "idleTimeoutSeconds", "max_idle_seconds"];
+  for (const key of candidateKeys) {
+    const raw = sessionInfo[key];
+    const parsed = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  }
+  return 900;
 }
 
 async function refreshAccessToken(bundle: OAuthBundle): Promise<OAuthBundle> {
@@ -919,6 +1030,7 @@ async function main(): Promise<void> {
     }
     writeJsonFile(SESSION_FILE, payload);
     appendLog({ event: "session_import", status: "ok", source: "setup" });
+    maybeStartKeepalive(payload);
     console.error(`Saved credentials to ${SESSION_FILE}`);
   };
 
@@ -942,6 +1054,7 @@ async function main(): Promise<void> {
       }
       writeJsonFile(SESSION_FILE, payload);
       appendLog({ event: "session_import", status: "ok", source: file ? "file" : "stdin" });
+      maybeStartKeepalive(payload);
       console.log(`Saved session to ${SESSION_FILE}`);
     });
 
@@ -956,6 +1069,7 @@ async function main(): Promise<void> {
     const lifetime = exp !== null ? Math.max(0, Math.floor(exp - Date.now() / 1000)) : null;
     const out = { status: response.status, lifetime };
     console.log(JSON.stringify(out));
+    console.log(`keepalive: ${keepaliveStatus()}`);
     if (!response.ok) process.exit(1);
   });
 
@@ -963,33 +1077,162 @@ async function main(): Promise<void> {
     .command("keepalive")
     .option("--once", "Run one probe/refresh cycle and exit")
     .action(async (cmdOpts: { once?: boolean }) => {
+      const activeProbeMs = 75_000;
+      const idleProbeMs = 150_000;
+      const prepareProbeMs = 60_000;
+      const refreshThresholdSeconds = 300;
+      const criticalThresholdSeconds = 90;
+      const maxRetries = 2;
+      const degradedAuthFailures = 2;
+      const retryBackoffMs = [2_000, 5_000, 15_000];
+      const thisPid = process.pid;
+      const existingPid = readKeepalivePid();
+      if (isProcessRunning(existingPid) && existingPid !== thisPid && !cmdOpts.once) {
+        throw new Error(`keepalive already running with pid ${existingPid}`);
+      }
+      if (!cmdOpts.once) writeKeepalivePid(thisPid);
+      const cleanupPid = (): void => {
+        if (!cmdOpts.once) clearKeepalivePidIfOwned(thisPid);
+      };
+      process.once("SIGINT", cleanupPid);
+      process.once("SIGTERM", cleanupPid);
+      process.once("exit", cleanupPid);
       const opts = program.opts<GlobalOptions>();
+      let consecutiveProbeFailures = 0;
+      let consecutiveAuthFailures = 0;
+      let wasIdle = false;
+      let nextProbeMs = activeProbeMs;
       const runCycle = async (): Promise<void> => {
         const bundle = await resolveOAuthBundle(opts);
         const noRefresh = ["1", "true", "yes"].includes(
           String(process.env.WSLI_NO_REFRESH ?? "").trim().toLowerCase()
         );
         let access = bundle.access_token;
-        let tokenInfo: Record<string, unknown> = {};
+        let tokenInfo: Record<string, unknown> | null = null;
+        let sessionInfo: Record<string, unknown> | null = null;
+        let expiresIn = Math.max(0, Math.floor((jwtExpUnix(access) ?? Date.now() / 1000) - Date.now() / 1000));
+        const accessFpBefore = tokenFingerprint(access);
+        let action: "probe" | "refresh" = "probe";
+        let refreshVerified = false;
+        let refreshNote = "probe_only";
         appendLog({ event: "auth_keeper_cycle", status: "start" });
         try {
-          const response = await fetch(OAUTH_TOKEN_INFO_URL, {
-            headers: { accept: "application/json", authorization: `Bearer ${access}` }
-          });
-          tokenInfo = (await response.json()) as Record<string, unknown>;
-          if (response.status === 401 || response.status === 403) {
-            if (noRefresh) throw new Error("Token probe returned 401/403 and refresh is disabled (WSLI_NO_REFRESH).");
-            if (!bundle.refresh_token) throw new Error("Token probe failed and no refresh_token available.");
-            const refreshed = await refreshAccessToken(bundle);
-            access = refreshed.access_token;
-            writeJsonFile(SESSION_FILE, refreshed);
-            tokenInfo = {
-              refreshed: true,
-              created_at: refreshed.created_at ?? null,
-              expires_in: refreshed.expires_in ?? null
-            };
-          } else if (!response.ok) {
-            throw new Error(`token/info HTTP ${response.status}: ${JSON.stringify(tokenInfo)}`);
+          let probeAttempt = 0;
+          let authProbeFailed = false;
+          while (true) {
+            try {
+              const response = await fetch(OAUTH_TOKEN_INFO_URL, {
+                headers: { accept: "application/json", authorization: `Bearer ${access}` }
+              });
+              tokenInfo = (await response.json()) as Record<string, unknown>;
+              if (response.status === 401 || response.status === 403) {
+                consecutiveAuthFailures += 1;
+                authProbeFailed = true;
+              } else if (!response.ok) {
+                throw new Error(`token/info HTTP ${response.status}: ${JSON.stringify(tokenInfo)}`);
+              } else {
+                sessionInfo = await getSessionInfo(access);
+                consecutiveAuthFailures = 0;
+                consecutiveProbeFailures = 0;
+              }
+              break;
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              if (probeAttempt >= maxRetries) throw new Error(message);
+              consecutiveProbeFailures += 1;
+              const waitMs = jitterDelayMs(retryBackoffMs[Math.min(probeAttempt, retryBackoffMs.length - 1)]);
+              appendLog({
+                event: "auth_probe_retry",
+                status: "retrying",
+                retry_attempt: probeAttempt + 1,
+                retry_delay_ms: waitMs,
+                message
+              });
+              probeAttempt += 1;
+              await sleepMs(waitMs);
+            }
+          }
+
+          const parsedProbeExpires = Number(tokenInfo?.expires_in);
+          if (Number.isFinite(parsedProbeExpires) && parsedProbeExpires >= 0) {
+            expiresIn = Math.floor(parsedProbeExpires);
+          } else {
+            const expUnix = jwtExpUnix(access);
+            expiresIn = expUnix !== null ? Math.max(0, Math.floor(expUnix - Date.now() / 1000)) : 0;
+          }
+
+          const forceRefresh = ["1", "true", "yes"].includes(
+            String(process.env.WSLI_KEEPALIVE_FORCE_REFRESH ?? "").trim().toLowerCase()
+          );
+          let shouldRefresh = forceRefresh || expiresIn <= refreshThresholdSeconds || authProbeFailed;
+          let forcePriority = expiresIn <= criticalThresholdSeconds;
+          if (consecutiveAuthFailures >= degradedAuthFailures) {
+            shouldRefresh = true;
+            forcePriority = true;
+          }
+
+          if (shouldRefresh) {
+            action = "refresh";
+            if (noRefresh) {
+              throw new Error("Refresh required but disabled (WSLI_NO_REFRESH).");
+            }
+            if (!bundle.refresh_token) {
+              throw new Error("Refresh required but no refresh_token available.");
+            }
+            const createdBefore = tokenInfo?.created_at;
+            const expiresBefore = expiresIn;
+            const expUnixBefore = jwtExpUnix(access);
+            const fpBefore = tokenFingerprint(access);
+            let refreshAttempt = 0;
+            while (true) {
+              try {
+                const refreshed = await refreshAccessToken(bundle);
+                access = refreshed.access_token;
+                writeJsonFile(SESSION_FILE, refreshed);
+                const verifyResponse = await fetch(OAUTH_TOKEN_INFO_URL, {
+                  headers: { accept: "application/json", authorization: `Bearer ${access}` }
+                });
+                const verifyInfo = (await verifyResponse.json()) as Record<string, unknown>;
+                if (!verifyResponse.ok) {
+                  throw new Error(`refresh verify HTTP ${verifyResponse.status}: ${JSON.stringify(verifyInfo)}`);
+                }
+                sessionInfo = await getSessionInfo(access);
+                const createdChanged = verifyInfo.created_at !== createdBefore;
+                const expiresAfter = Number(verifyInfo.expires_in);
+                const expiresJumped = Number.isFinite(expiresAfter) && expiresAfter >= expiresBefore + 240;
+                const expUnixAfter = jwtExpUnix(access);
+                const expUnixJumped =
+                  expUnixBefore !== null && expUnixAfter !== null && expUnixAfter >= expUnixBefore + 240;
+                const fpChanged = tokenFingerprint(access) !== fpBefore;
+                refreshVerified = createdChanged || expiresJumped || expUnixJumped || fpChanged;
+                if (!refreshVerified) {
+                  refreshNote = "not_rotated";
+                  throw new Error("refresh verification did not show token rollover");
+                }
+                tokenInfo = verifyInfo;
+                expiresIn = Number.isFinite(expiresAfter)
+                  ? Math.floor(expiresAfter)
+                  : Math.max(0, Math.floor((jwtExpUnix(access) ?? Date.now() / 1000) - Date.now() / 1000));
+                consecutiveAuthFailures = 0;
+                refreshNote = "verified";
+                break;
+              } catch (error) {
+                if (refreshAttempt >= maxRetries) {
+                  throw new Error(error instanceof Error ? error.message : String(error));
+                }
+                const waitMs = jitterDelayMs(retryBackoffMs[Math.min(refreshAttempt, retryBackoffMs.length - 1)]);
+                appendLog({
+                  event: "auth_refresh_retry",
+                  status: "retrying",
+                  retry_attempt: refreshAttempt + 1,
+                  retry_delay_ms: waitMs,
+                  critical: forcePriority,
+                  message: error instanceof Error ? error.message : String(error)
+                });
+                refreshAttempt += 1;
+                await sleepMs(waitMs);
+              }
+            }
           }
         } catch (error) {
           appendLog({
@@ -999,20 +1242,60 @@ async function main(): Promise<void> {
           });
           throw new Error(`keepalive probe failed: ${error instanceof Error ? error.message : String(error)}`);
         }
+
+        const activityAgeSeconds = sessionInfo ? extractActivityAgeSeconds(sessionInfo) : null;
+        const idleTimeoutSeconds = sessionInfo ? extractIdleTimeoutSeconds(sessionInfo) : 900;
+        const isIdleBySession = activityAgeSeconds !== null && activityAgeSeconds >= idleTimeoutSeconds;
+        const isIdle = isIdleBySession;
+        const nowIdleToActive = wasIdle && !isIdle;
+        wasIdle = isIdle;
+        let cadenceMs = isIdle ? idleProbeMs : activeProbeMs;
+        if (!isIdle && expiresIn > refreshThresholdSeconds && expiresIn <= 900) {
+          cadenceMs = Math.min(cadenceMs, prepareProbeMs);
+        }
+        if (nowIdleToActive) cadenceMs = 0;
+        nextProbeMs = cadenceMs;
+        if (action === "refresh" && !refreshVerified) {
+          throw new Error("refresh path did not produce verified token state");
+        }
+
         appendLog({
           event: "auth_keeper_cycle",
           status: "ok",
-          expires_in: tokenInfo.expires_in ?? null
+          action,
+          token_before_fp: accessFpBefore,
+          token_after_fp: tokenFingerprint(access),
+          expires_in: expiresIn,
+          refresh_verified: refreshVerified,
+          refresh_note: refreshNote,
+          session_info_unavailable: sessionInfo === null,
+          activity_age_s: activityAgeSeconds,
+          idle_timeout_s: idleTimeoutSeconds,
+          idle_mode: isIdle,
+          next_probe_ms: cadenceMs,
+          probe_failures: consecutiveProbeFailures,
+          auth_failures: consecutiveAuthFailures
         });
-        print({ action: "probe", token_info: tokenInfo });
+        print({
+          action,
+          token_info: tokenInfo ?? {},
+          session_info: sessionInfo ?? {},
+          expires_in: expiresIn,
+          idle_mode: isIdle,
+          next_probe_ms: cadenceMs
+        });
       };
       if (cmdOpts.once) {
         await runCycle();
         return;
       }
-      while (true) {
-        await runCycle();
-        await new Promise((resolve) => setTimeout(resolve, 75_000));
+      try {
+        while (true) {
+          await runCycle();
+          await sleepMs(nextProbeMs);
+        }
+      } finally {
+        cleanupPid();
       }
     });
 
@@ -1184,6 +1467,8 @@ async function main(): Promise<void> {
     .option("--security-id <id>")
     .option("--shares <n>")
     .option("--dollars <amount>")
+    .option("--order <type>", "market or limit", "market")
+    .option("--limit-price <n>", "Required when --order limit")
     .option("--account-id <id>")
     .option("--account-type <type>")
     .option("--account-index <n>")
@@ -1208,6 +1493,37 @@ async function main(): Promise<void> {
       if ((shares === undefined) === (dollars === undefined)) {
         throw new Error("Provide exactly one of --shares or --dollars.");
       }
+      const orderStyle = String(cmdOpts.order ?? "market").trim().toLowerCase();
+      if (orderStyle !== "market" && orderStyle !== "limit") {
+        throw new Error("--order must be market or limit.");
+      }
+      const limitPrice = cmdOpts.limitPrice !== undefined ? Number.parseFloat(String(cmdOpts.limitPrice)) : undefined;
+      if (orderStyle === "limit" && (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0)) {
+        throw new Error("limit orders require positive --limit-price.");
+      }
+      if (orderStyle === "market" && limitPrice !== undefined) {
+        throw new Error("--limit-price can only be used with --order limit.");
+      }
+      if (orderStyle === "limit" && dollars !== undefined) {
+        throw new Error("limit buys currently require --shares (not --dollars).");
+      }
+      if (orderStyle === "limit" && shares !== undefined && !Number.isInteger(shares)) {
+        throw new Error("limit buys require whole shares (fractional shares are not accepted).");
+      }
+      let accountCurrency: string | null = null;
+      if (orderStyle === "limit" && shares !== undefined && limitPrice !== undefined) {
+        const accounts = await listAccounts(token, bundle);
+        const account = accounts.find((row) => String(row.id ?? "") === accountId);
+        const liquid = Number((account?.liquid_to_buy as Record<string, unknown> | undefined)?.amount);
+        accountCurrency = String((account?.liquid_to_buy as Record<string, unknown> | undefined)?.currency ?? "").trim() || null;
+        const estimatedCost = shares * limitPrice;
+        if (Number.isFinite(liquid) && accountCurrency === "USD" && liquid < estimatedCost) {
+          throw new Error(
+            `Insufficient USD buying power for limit buy (need about ${estimatedCost.toFixed(2)} USD, available ${liquid.toFixed(2)} USD). ` +
+              "Add funds before submitting."
+          );
+        }
+      }
       if (dollars !== undefined) {
         await assertDollarBuyEligibleSecurity(token, bundle, resolvedSecurityId);
       }
@@ -1218,18 +1534,22 @@ async function main(): Promise<void> {
         executionType: shares && shares % 1 !== 0 ? "FRACTIONAL" : dollars ? "FRACTIONAL" : "REGULAR",
         orderType: dollars ? "BUY_VALUE" : "BUY_QUANTITY",
         securityId: resolvedSecurityId,
-        timeInForce: shares && shares % 1 === 0 ? "DAY" : null
+        timeInForce: orderStyle === "limit" || (shares && shares % 1 === 0) ? "DAY" : null
       };
       if (shares !== undefined) input.quantity = shares;
       if (dollars !== undefined) input.value = dollars;
+      if (limitPrice !== undefined) input.limitPrice = limitPrice;
       appendLog({
         event: "buy_submit_attempt",
         status: "start",
         account_id: accountId,
         security_id: resolvedSecurityId,
         external_id: externalId,
+        order_style: orderStyle,
         execution_type: input.executionType,
         order_type: input.orderType,
+        limit_price: input.limitPrice ?? null,
+        account_currency: accountCurrency,
         quantity: input.quantity ?? null,
         value: input.value ?? null
       });
