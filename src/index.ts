@@ -24,6 +24,40 @@ const BUY_HISTORY_FILE = path.join(CONFIG_DIR, "buy_history.jsonl");
 const KEEPALIVE_PID_FILE = path.join(CONFIG_DIR, "keepalive.pid");
 const DEFAULT_API_VERSION = "12";
 const SESSION_ID = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+const COLOR_ENABLED = process.stdout.isTTY && process.env.NO_COLOR !== "1";
+
+const ANSI = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  cyan: "\x1b[96m",
+  blue: "\x1b[94m",
+  green: "\x1b[92m",
+  yellow: "\x1b[93m",
+  red: "\x1b[91m",
+  magenta: "\x1b[95m",
+  gray: "\x1b[90m",
+  link: "\x1b[38;5;214m"
+} as const;
+
+function tone(text: string, color: keyof typeof ANSI, bold = false): string {
+  if (!COLOR_ENABLED) return text;
+  const prefix = bold ? `${ANSI.bold}${ANSI[color]}` : ANSI[color];
+  return `${prefix}${text}${ANSI.reset}`;
+}
+
+function toneStatus(value: string): string {
+  const clean = value.trim().toLowerCase();
+  if (["ok", "accepted", "filled", "success", "active", "open", "yes"].includes(clean)) {
+    return tone(value, "green", true);
+  }
+  if (["warn", "warning", "pending", "new", "idle", "unavailable"].includes(clean)) {
+    return tone(value, "yellow", true);
+  }
+  if (["error", "failed", "rejected", "no", "unknown"].includes(clean)) {
+    return tone(value, "red", true);
+  }
+  return tone(value, "cyan");
+}
 
 const FETCH_TRADE_ACCOUNT_LIST = `
 query FetchTradeAccountList($identityId: ID!, $pageSize: Int = 50, $cursor: String) {
@@ -214,13 +248,37 @@ const EXPORT_SESSION_SNIPPET = `(() => {
       console.error("No access_token found in cookie payload.");
       return;
     }
-    console.log(\`access_token=\${out.access_token}\`);
-    if (out.refresh_token) console.log(\`refresh_token=\${out.refresh_token}\`);
-    if (out.client_id) console.log(\`client_id=\${out.client_id}\`);
+    const rule = "══════════════════════════════════════════════════════════════════════";
+    console.log("");
+    console.log(rule);
+    console.log(" wsli — Copy these lines into wsli setup (paste the whole block)");
+    console.log(" Each credential line starts with access_token, refresh_token, or client_id.");
+    console.log(" access_token is required; refresh_token and client_id help keep you signed in.");
+    console.log(rule);
+    console.log("");
+    console.log("access_token=" + out.access_token);
+    if (out.refresh_token) console.log("refresh_token=" + out.refresh_token);
+    if (out.client_id) console.log("client_id=" + out.client_id);
+    console.log("");
+    console.log(rule);
+    console.log(" end wsli output — do not copy anything below this line");
+    console.log(rule);
+    console.log("");
   } catch (err) {
     console.error("Failed to parse cookie payload:", err);
   }
 })();`;
+
+const SNIPPET_TERMINAL_BAR = "════════════════════════════════════════════════════════════════════════";
+
+function printSnippetBoundedForCopy(snippet: string): void {
+  console.log("");
+  console.log(tone("Select only the JavaScript between the yellow bars (do not copy the bars).", "cyan", true));
+  console.log(tone(SNIPPET_TERMINAL_BAR, "yellow"));
+  console.log(snippet);
+  console.log(tone(SNIPPET_TERMINAL_BAR, "yellow"));
+  console.log("");
+}
 
 function ensureConfigDir(): void {
   mkdirSync(CONFIG_DIR, { recursive: true });
@@ -252,6 +310,7 @@ function parseSessionInput(raw: string): OAuthBundle {
       if (typeof parsed.client_id === "string" && parsed.client_id.trim()) {
         payload.client_id = parsed.client_id.trim();
       }
+      assertPlausibleAccessToken(payload.access_token);
       return payload;
     } catch (err) {
       if (err instanceof Error && err.message === "Session input must include access_token.") {
@@ -292,11 +351,12 @@ function parseSessionInput(raw: string): OAuthBundle {
   }
   if (!payload.access_token) {
     if (lines.length === 1 && !lines[0].includes("=")) {
-      payload.access_token = lines[0];
+      payload.access_token = lines[0].trim();
     } else {
       throw new Error("Session input must include access_token.");
     }
   }
+  assertPlausibleAccessToken(payload.access_token);
   return payload;
 }
 
@@ -313,6 +373,44 @@ async function readAllStdinInteractive(): Promise<string> {
     return lines.join("\n");
   }
   return readFileSync(0, "utf-8");
+}
+
+async function promptEnter(message: string): Promise<void> {
+  if (!process.stdin.isTTY) return;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  await new Promise<void>((resolve) => {
+    rl.question(`${message}\n`, () => {
+      rl.close();
+      resolve();
+    });
+  });
+}
+
+function devToolsOpenInstructions(): string[] {
+  const currentOs = process.platform === "darwin" ? "macOS" : process.platform === "win32" ? "Windows" : "Linux";
+  return [
+    `Current OS detected: ${currentOs}`,
+    "Mac: Option + Command + I, then open Console.",
+    "Windows: Ctrl + Shift + I (or F12), then open Console.",
+    "Linux: Ctrl + Shift + I (or F12), then open Console."
+  ];
+}
+
+async function readSessionInputUntilBlankLine(): Promise<string> {
+  if (!process.stdin.isTTY) return readAllStdinInteractive();
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const lines: string[] = [];
+  while (true) {
+    const line = await new Promise<string>((resolve) => {
+      rl.question(lines.length === 0 ? "> " : "... ", resolve);
+    });
+    const text = line.trim();
+    if (!text && lines.length > 0) break;
+    if (!text) continue;
+    lines.push(line);
+  }
+  rl.close();
+  return lines.join("\n");
 }
 
 function writeJsonl(filePath: string, row: Record<string, unknown>): void {
@@ -405,6 +503,58 @@ function jwtExpUnix(accessToken: string): number | null {
   const payload = decodeJwtPayload(accessToken);
   if (!payload || typeof payload.exp !== "number") return null;
   return payload.exp;
+}
+
+function looksLikeJwt(accessToken: string): boolean {
+  const parts = accessToken.trim().split(".");
+  return parts.length === 3 && parts.every((part) => part.length > 0);
+}
+
+function assertPlausibleAccessToken(accessToken: string): void {
+  const token = accessToken.trim();
+  if (!token) throw new Error("access_token is empty.");
+  if (!looksLikeJwt(token)) {
+    throw new Error(
+      "access_token does not look like a JWT. Paste the full lines from the browser console (access_token=..., refresh_token=..., client_id=...)."
+    );
+  }
+}
+
+function oauthTokenInfoErrorCode(status: number): string {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 429) return "rate_limited";
+  return "token_check_failed";
+}
+
+function oauthTokenInfoHumanMessage(status: number): string {
+  if (status === 401) {
+    return "Unauthorized (401): access token is missing, invalid, or expired. Run wsli setup and paste fresh tokens.";
+  }
+  if (status === 403) {
+    return "Forbidden (403): this token is not accepted for API checks.";
+  }
+  if (status === 429) {
+    return "Rate limited (429): try again in a moment.";
+  }
+  return `Token check failed (HTTP ${status}).`;
+}
+
+async function verifyAccessTokenWithApi(accessToken: string): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(OAUTH_TOKEN_INFO_URL, {
+      headers: { accept: "application/json", authorization: `Bearer ${accessToken}` }
+    });
+  } catch (err) {
+    throw new Error(
+      `Could not verify session with Wealthsimple: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`${oauthTokenInfoHumanMessage(response.status)} Credentials were not saved.`);
+  }
 }
 
 function accessTokenNeedsRefresh(accessToken: string, skewSeconds = 120): boolean {
@@ -901,7 +1051,7 @@ function formatHistoryEntry(row: Record<string, unknown>, index: number, account
   const limitPrice = Number(row.limit_price);
   const stopPrice = Number(row.stop_price);
   const lines: string[] = [];
-  lines.push(`Trade ${index + 1}`);
+  lines.push(tone(`Trade ${index + 1}`, "magenta", true));
   if (historyId) lines.push(`ID: ${historyId}`);
   lines.push(`Time: ${tsLabel}${age ? ` (${age})` : ""}`);
   lines.push(`Action: ${action}`);
@@ -916,7 +1066,7 @@ function formatHistoryEntry(row: Record<string, unknown>, index: number, account
   }
   if (Number.isFinite(limitPrice) && limitPrice > 0) lines.push(`Limit: ${formatMoney(limitPrice)}`);
   if (Number.isFinite(stopPrice) && stopPrice > 0) lines.push(`Stop: ${formatMoney(stopPrice)}`);
-  lines.push(`Status: ${status}`);
+  lines.push(`Status: ${toneStatus(status)}`);
   if (Number.isFinite(filledQuantity) && filledQuantity > 0) {
     const fillText = Number.isFinite(averageFillPrice) && averageFillPrice > 0
       ? `${filledQuantity} @ ${formatMoney(averageFillPrice)}`
@@ -992,12 +1142,12 @@ function formatLogEntry(row: Record<string, unknown>, index: number): string {
       return `  ${key}: ${String(value)}`;
     });
   const lines: string[] = [];
-  lines.push(`Log ${index + 1}`);
+  lines.push(tone(`Log ${index + 1}`, "magenta", true));
   if (logId) lines.push(`ID: ${logId}`);
   lines.push(`Time: ${tsLabel}${age ? ` (${age})` : ""}`);
   lines.push(`Event: ${titleCase(event)}`);
-  if (status) lines.push(`Status: ${displayStatus(status)}`);
-  if (level) lines.push(`Level: ${titleCase(level)}`);
+  if (status) lines.push(`Status: ${toneStatus(displayStatus(status))}`);
+  if (level) lines.push(`Level: ${toneStatus(titleCase(level))}`);
   if (sessionId) lines.push(`Session: ${sessionId}`);
   if (symbol) lines.push(`Symbol: ${symbol}`);
   if (accountId) lines.push(`Account: ${accountId}`);
@@ -1217,7 +1367,7 @@ function formatPortfolioHuman(
     ?? "USD";
 
   const lines = [
-    "Portfolio",
+    tone("Portfolio", "blue", true),
     `Total value  ${formatCurrencyAmount(totalValue, portfolioCurrency)}`,
     `Invested     ${formatCurrencyAmount(totalInvested, portfolioCurrency)}`,
     `Cash         ${formatCurrencyAmount(totalCash, portfolioCurrency)}`,
@@ -1227,7 +1377,7 @@ function formatPortfolioHuman(
 
   for (const summary of accountSummaries) {
     lines.push("");
-    lines.push(summary.label);
+    lines.push(tone(summary.label, "cyan", true));
     lines.push(`Value        ${formatCurrencyAmount(summary.balance?.amount ?? 0, summary.balance?.currency ?? summary.currency)}`);
     lines.push(`Cash         ${formatCurrencyAmount(summary.cash?.amount ?? 0, summary.cash?.currency ?? summary.currency)}`);
     if (!summary.holdings.length) {
@@ -1256,12 +1406,13 @@ function accountsKv(label: string, value: string): string {
 
 function formatAccountsHuman(rows: Record<string, unknown>[]): string {
   const legend =
-    "Open accounts only. Fields below match buy/sell --account-type (account_type).\n" +
-    "trade_custodian: yes = WS/TR branch (CLI can place orders here).\n" +
-    "liquid_to_buy is estimated as total balance minus current stock positions.\n";
+    `${tone("Open accounts only.", "gray")} Fields below match buy/sell --account-type (account_type).\n` +
+    `${tone("trade_custodian", "gray")}: yes = WS/TR branch (CLI can place orders here).\n` +
+    `${tone("liquid_to_buy", "gray")} is estimated as total balance minus current stock positions.\n`;
   const blocks = rows.map((row, i) => {
     const n = i + 1;
-    const sep = `── Account ${n} of ${rows.length} ──`;
+    const sep = tone(`── Account ${n} of ${rows.length} ──`, "blue", true);
+    const tradeCustodian = row.trade_custodian === true ? toneStatus("yes") : toneStatus("no");
     return [
       "",
       sep,
@@ -1275,7 +1426,7 @@ function formatAccountsHuman(rows: Record<string, unknown>[]): string {
       accountsKv("liquid_to_buy", formatMoneyDisplay(row.liquid_to_buy)),
       accountsKv("in_stocks", formatMoneyDisplay(row.stocks_value)),
       accountsKv("net_deposits", formatMoneyDisplay(row.net_deposits)),
-      accountsKv("trade_custodian", row.trade_custodian === true ? "yes" : "no")
+      accountsKv("trade_custodian", tradeCustodian)
     ].join("\n");
   });
   return legend + blocks.join("\n") + "\n";
@@ -1695,7 +1846,11 @@ async function main(): Promise<void> {
   const program = withGlobalOptions(new Command())
     .name("wsli")
     .description(
-      "Wealthsimple CLI: read-only GraphQL plus Trade REST (accounts, portfolio, market buy/sell with --confirm, plus --dry-run)."
+      tone(
+        "Wealthsimple CLI: GraphQL + Trade REST for accounts, portfolio, and trading (buy/sell with --confirm, plus --dry-run).",
+        "cyan",
+        true
+      )
     )
     .version(VERSION);
 
@@ -1796,29 +1951,54 @@ async function main(): Promise<void> {
     );
 
   const runSetup = async (): Promise<void> => {
-    console.error("Step 1: Open https://my.wealthsimple.com and sign in.");
-    console.error("Step 2: Paste this snippet in DevTools Console and run it:\n");
-    console.log(EXPORT_SESSION_SNIPPET);
-    console.error("\nStep 3: Paste the token lines here and press Ctrl-D:\n");
-    const raw = await readAllStdinInteractive();
-    const payload = parseSessionInput(raw);
-    if (typeof payload.access_token !== "string" || !payload.access_token.trim()) {
-      throw new Error("Session input is missing access_token.");
+    const wealthsimpleUrl = "https://my.wealthsimple.com";
+    console.log(tone("WSLI Setup", "blue", true));
+    console.log("");
+    console.log(`  ${tone("Use an Incognito / Private window.", "cyan", true)}`);
+    console.log(`  ${tone("Chrome:", "cyan", true)} ${tone("Incognito.", "cyan")}`);
+    console.log(`  ${tone("Firefox / Safari:", "cyan", true)} ${tone("Private Window.", "cyan")}`);
+    console.log("");
+    console.log(`  ${tone("When you are done, close that tab or window.", "cyan", true)}`);
+    console.log(`  ${tone("Do not Sign out.", "red", true)}`);
+    console.log("");
+    console.log("  Signing out can invalidate refresh tokens and break wsli keepalive.");
+    console.log("");
+    console.log(
+      `${tone("Step 1", "magenta", true)}: ${tone("Log in at", "cyan")} ${tone(wealthsimpleUrl, "link", true)}`
+    );
+    console.log("");
+    await promptEnter(tone("Press Enter after you are logged in.", "yellow", true));
+
+    console.log("");
+    console.log(`${tone("Step 2", "yellow", true)}: Open DevTools.`);
+    console.log("");
+    console.log("  Paste and run this snippet in the Console.");
+    console.log("");
+    const devtoolsLines = devToolsOpenInstructions();
+    for (const line of devtoolsLines) {
+      console.log(`- ${tone(line, "cyan", true)}`);
     }
+    console.log("");
+    printSnippetBoundedForCopy(EXPORT_SESSION_SNIPPET);
+
+    console.log("");
+    console.log(`${tone("Step 3", "yellow", true)}: Paste what the browser printed below.`);
+    console.log("");
+    console.log(
+      "Paste only the credential lines from the browser (between the horizontal rules), starting with access_token."
+    );
+    console.log("");
+    console.log("When finished, press Enter on an empty line.");
+    const raw = await readSessionInputUntilBlankLine();
+    const payload = parseSessionInput(raw);
+    await verifyAccessTokenWithApi(payload.access_token);
     writeJsonFile(SESSION_FILE, payload);
     appendLog({ event: "session_import", status: "ok", source: "setup" });
     maybeStartKeepalive(payload);
-    console.error(`Saved credentials to ${SESSION_FILE}`);
+    console.log(tone(`Saved credentials to ${SESSION_FILE}`, "green", true));
   };
 
   program.command("setup").description("Interactive onboarding flow").action(runSetup);
-
-  program
-    .command("snippet")
-    .description("Print browser console snippet for session export")
-    .action(() => {
-      console.log(EXPORT_SESSION_SNIPPET);
-    });
 
   program
     .command("import-session")
@@ -1826,9 +2006,7 @@ async function main(): Promise<void> {
     .action(async (file?: string) => {
       const content = file ? readFileSync(path.resolve(file), "utf-8") : await readAllStdinInteractive();
       const payload = parseSessionInput(content);
-      if (typeof payload.access_token !== "string" || !payload.access_token.trim()) {
-        throw new Error("Session import requires access_token.");
-      }
+      await verifyAccessTokenWithApi(payload.access_token);
       writeJsonFile(SESSION_FILE, payload);
       appendLog({ event: "session_import", status: "ok", source: file ? "file" : "stdin" });
       maybeStartKeepalive(payload);
@@ -1837,17 +2015,67 @@ async function main(): Promise<void> {
 
   program.command("ping").action(async () => {
     const opts = program.opts<GlobalOptions>();
-    const { token } = await resolveAccessToken(opts);
+    let token: string;
+    try {
+      ({ token } = await resolveAccessToken(opts));
+    } catch (err) {
+      const detail = errorMessage(err);
+      const message =
+        detail.includes("No credentials found") || detail.includes("No access_token")
+          ? `No auth token configured. Run wsli setup or wsli import-session. (${detail})`
+          : detail;
+      console.log(
+        JSON.stringify({
+          status: null,
+          lifetime: null,
+          error: "no_credentials",
+          message
+        })
+      );
+      console.error(tone(message, "red", true));
+      console.log(`keepalive: ${keepaliveStatus()}`);
+      process.exit(1);
+    }
+
+    try {
+      assertPlausibleAccessToken(token);
+    } catch (err) {
+      const message = errorMessage(err);
+      console.log(
+        JSON.stringify({
+          status: null,
+          lifetime: null,
+          error: "invalid_token_shape",
+          message
+        })
+      );
+      console.error(tone(message, "red", true));
+      console.log(`keepalive: ${keepaliveStatus()}`);
+      process.exit(1);
+    }
+
     const response = await fetch(OAUTH_TOKEN_INFO_URL, {
       headers: { accept: "application/json", authorization: `Bearer ${token}` }
     });
     await response.json().catch(() => ({}));
     const exp = jwtExpUnix(token);
     const lifetime = exp !== null ? Math.max(0, Math.floor(exp - Date.now() / 1000)) : null;
-    const out = { status: response.status, lifetime };
-    console.log(JSON.stringify(out));
+    if (!response.ok) {
+      const message = oauthTokenInfoHumanMessage(response.status);
+      console.log(
+        JSON.stringify({
+          status: response.status,
+          lifetime,
+          error: oauthTokenInfoErrorCode(response.status),
+          message
+        })
+      );
+      console.error(tone(message, "red", true));
+      console.log(`keepalive: ${keepaliveStatus()}`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ status: response.status, lifetime }));
     console.log(`keepalive: ${keepaliveStatus()}`);
-    if (!response.ok) process.exit(1);
   });
 
   program
@@ -2057,14 +2285,14 @@ async function main(): Promise<void> {
         const sessionFlag = sessionInfo === null ? "unavailable" : "ok";
         const nextProbeSeconds = Math.floor(cadenceMs / 1000);
         const parts = [
-          `action=${action}`,
-          `expires_in=${expiresIn}s`,
-          `refresh_verified=${refreshFlag}`,
-          `idle_mode=${isIdle ? "yes" : "no"}`,
-          `session_info=${sessionFlag}`,
-          `next_probe=${nextProbeSeconds}s`,
-          `probe_failures=${consecutiveProbeFailures}`,
-          `auth_failures=${consecutiveAuthFailures}`
+          `action=${tone(action, "cyan", true)}`,
+          `expires_in=${tone(`${expiresIn}s`, "blue", true)}`,
+          `refresh_verified=${toneStatus(refreshFlag)}`,
+          `idle_mode=${toneStatus(isIdle ? "yes" : "no")}`,
+          `session_info=${toneStatus(sessionFlag)}`,
+          `next_probe=${tone(`${nextProbeSeconds}s`, "magenta", true)}`,
+          `probe_failures=${consecutiveProbeFailures > 0 ? tone(`${consecutiveProbeFailures}`, "yellow", true) : tone("0", "green", true)}`,
+          `auth_failures=${consecutiveAuthFailures > 0 ? tone(`${consecutiveAuthFailures}`, "red", true) : tone("0", "green", true)}`
         ];
         console.log(parts.join(" "));
       };

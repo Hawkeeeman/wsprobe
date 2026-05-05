@@ -42,7 +42,7 @@ Use `wsli --help` and `wsli <command> --help` for details.
 
 | Area | Commands |
 |------|----------|
-| Session | `setup`, `snippet`, `import-session`, `config-path`, `session-path`, `ping`, `keepalive` |
+| Session | `setup`, `import-session`, `config-path`, `session-path`, `ping`, `keepalive` |
 | Market data | `lookup`, `security` |
 | Account | `accounts`, `positions`, `position-for-symbol`, `portfolio` |
 | Orders | `buy` (supports `--order market|limit|stop_limit|stop_market`, with `--stop-price` for stop orders), `sell` (supports `--order market|limit`, `--sell-all`, `--confirm` required), `transfer` (internal account transfer with `--from/--to` selectors, `--confirm` required), `trade-smoke` |

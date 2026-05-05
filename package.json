@@ -1,5 +1,5 @@
 {
-  "name": "wsli",
+  "name": "@hawkeeman/wsli",
   "version": "0.2.1",
   "description": "Wealthsimple CLI: GraphQL + Trade REST (accounts, portfolio, buy/sell)",
   "license": "MIT",
