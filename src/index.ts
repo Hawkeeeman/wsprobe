@@ -954,6 +954,122 @@ function formatMoneyDisplay(value: unknown): string {
   return currency ? `${a} ${currency}` : a;
 }
 
+function formatCurrencyAmount(amount: number, currency?: string): string {
+  if (!Number.isFinite(amount)) return "—";
+  const code = String(currency ?? "").trim().toUpperCase();
+  if (!code) return amount.toFixed(2);
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: code,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(amount);
+  } catch {
+    return `${amount.toFixed(2)} ${code}`;
+  }
+}
+
+function moneyParts(value: unknown): { amount: number; currency: string | null } | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const amount = Number(row.amount);
+  if (!Number.isFinite(amount)) return null;
+  const currency = String(row.currency ?? "").trim().toUpperCase() || null;
+  return { amount, currency };
+}
+
+function formatQuantity(value: unknown): string {
+  const qty = Number(value);
+  if (!Number.isFinite(qty)) return "—";
+  return Number.isInteger(qty) ? `${qty}` : qty.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function portfolioAccountLabel(account: Record<string, unknown>): string {
+  const type = accountTypeLabel(String(account.account_type ?? ""));
+  const nickname = String(account.nickname ?? "").trim();
+  return nickname ? `${nickname} (${type})` : type;
+}
+
+function formatPortfolioHuman(
+  rows: Array<{ account: Record<string, unknown>; positions: Record<string, unknown>[] }>
+): string {
+  const accountSummaries = rows.map(({ account, positions }) => {
+    const balance = moneyParts(account.current_balance);
+    const cash = moneyParts(account.liquid_to_buy);
+    const holdings = positions
+      .map((position) => {
+        const value = Number(position.value);
+        if (!Number.isFinite(value) || value <= 0) return null;
+        return {
+          symbol: String(position.symbol ?? "").trim().toUpperCase() || "—",
+          name: String(position.name ?? "").trim(),
+          quantity: Number(position.quantity),
+          value,
+          currency: String(position.currency ?? account.currency ?? "").trim().toUpperCase() || "USD"
+        };
+      })
+      .filter((position): position is {
+        symbol: string;
+        name: string;
+        quantity: number;
+        value: number;
+        currency: string;
+      } => position !== null)
+      .sort((a, b) => b.value - a.value);
+
+    const invested = holdings.reduce((sum, position) => sum + position.value, 0);
+
+    return {
+      label: portfolioAccountLabel(account),
+      balance,
+      cash,
+      invested,
+      currency: String(account.currency ?? "").trim().toUpperCase() || balance?.currency || cash?.currency || "USD",
+      holdings
+    };
+  });
+
+  const totalValue = accountSummaries.reduce((sum, row) => sum + (row.balance?.amount ?? 0), 0);
+  const totalCash = accountSummaries.reduce((sum, row) => sum + (row.cash?.amount ?? 0), 0);
+  const totalInvested = accountSummaries.reduce((sum, row) => sum + row.invested, 0);
+  const totalHoldings = accountSummaries.reduce((sum, row) => sum + row.holdings.length, 0);
+  const portfolioCurrency = accountSummaries.find((row) => row.balance?.currency)?.balance?.currency
+    ?? accountSummaries.find((row) => row.cash?.currency)?.cash?.currency
+    ?? accountSummaries[0]?.currency
+    ?? "USD";
+
+  const lines = [
+    "Portfolio",
+    `Total value  ${formatCurrencyAmount(totalValue, portfolioCurrency)}`,
+    `Invested     ${formatCurrencyAmount(totalInvested, portfolioCurrency)}`,
+    `Cash         ${formatCurrencyAmount(totalCash, portfolioCurrency)}`,
+    `Accounts     ${accountSummaries.length}`,
+    `Holdings     ${totalHoldings}`
+  ];
+
+  for (const summary of accountSummaries) {
+    lines.push("");
+    lines.push(summary.label);
+    lines.push(`Value        ${formatCurrencyAmount(summary.balance?.amount ?? 0, summary.balance?.currency ?? summary.currency)}`);
+    lines.push(`Cash         ${formatCurrencyAmount(summary.cash?.amount ?? 0, summary.cash?.currency ?? summary.currency)}`);
+    if (!summary.holdings.length) {
+      lines.push("No holdings");
+      continue;
+    }
+    for (const holding of summary.holdings) {
+      const positionWeight = summary.invested > 0 ? Math.round((holding.value / summary.invested) * 100) : 0;
+      const details = [`${formatQuantity(holding.quantity)} sh`, formatCurrencyAmount(holding.value, holding.currency)];
+      if (positionWeight > 0) details.push(`${positionWeight}%`);
+      const namePart = holding.name ? ` - ${holding.name}` : "";
+      lines.push(`${holding.symbol}${namePart}`);
+      lines.push(`  ${details.join("  ")}`);
+    }
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
 const ACCOUNTS_LABEL_W = 20;
 
 function accountsKv(label: string, value: string): string {
@@ -1788,27 +1904,15 @@ async function main(): Promise<void> {
     const opts = program.opts<GlobalOptions>();
     const { token, bundle } = await resolveAccessToken(opts);
     const accounts = await listAccounts(token, bundle);
-    const out: Record<string, unknown>[] = [];
+    const out: Array<{ account: Record<string, unknown>; positions: Record<string, unknown>[] }> = [];
     for (const account of accounts) {
       const accountId = String(account.id);
       const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
-      const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
+      const positions = ((((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions) ??
+        []) as Record<string, unknown>[];
       out.push({ account, positions });
     }
-    print(out);
-  });
-
-  program.command("funding").action(async () => {
-    const opts = program.opts<GlobalOptions>();
-    const { token, bundle } = await resolveAccessToken(opts);
-    const rows = await listAccounts(token, bundle);
-    const funding = rows.map((row) => ({
-      id: row.id,
-      account_type: row.account_type,
-      current_balance: row.current_balance,
-      net_deposits: row.net_deposits
-    }));
-    print(funding);
+    console.log(formatPortfolioHuman(out));
   });
 
   program
