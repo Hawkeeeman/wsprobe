@@ -1783,24 +1783,6 @@ async function main(): Promise<void> {
     });
 
   program
-    .command("restrictions")
-    .requiredOption("--security-id <id>", "Security id (sec-s-...)")
-    .option("--side <side>", "BUY or SELL", "BUY")
-    .action(async (cmdOpts: { securityId: string; side: string }) => {
-      const opts = program.opts<GlobalOptions>();
-      const { token, bundle } = await resolveAccessToken(opts);
-      const side = cmdOpts.side.toUpperCase();
-      if (side !== "BUY" && side !== "SELL") throw new Error("--side must be BUY or SELL");
-      const payload = await graphqlRequest(token, "FetchSoOrdersLimitOrderRestrictions", FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS, {
-        args: {
-          securityId: normalizeSecurityId(cmdOpts.securityId),
-          side
-        }
-      }, bundle);
-      print(payload);
-    });
-
-  program
     .command("preview-buy")
     .argument("[securityOrQuery]", "Security id or ticker/query")
     .option("--symbol <ticker>", "Ticker/search text instead of positional arg")
