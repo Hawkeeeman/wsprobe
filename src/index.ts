@@ -758,11 +758,45 @@ function parsePositiveIntOption(value: string | undefined, optionName: string, d
     if (defaultValue !== undefined) return defaultValue;
     throw new Error(`${optionName} is required.`);
   }
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
+  const text = value.trim();
+  if (!/^\d+$/.test(text)) {
     throw new Error(`${optionName} must be a positive integer.`);
   }
+  const parsed = Number(text);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${optionName} must be a positive integer.`);
   return parsed;
+}
+
+function parseOptionalPositiveIntOption(value: string | undefined, optionName: string): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  return parsePositiveIntOption(value, optionName);
+}
+
+function parsePositiveNumberOption(value: string | undefined, optionName: string): number {
+  if (value === undefined || value === "") throw new Error(`${optionName} is required.`);
+  const parsed = Number(value.trim());
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${optionName} must be a positive number.`);
+  return parsed;
+}
+
+function parseOptionalPositiveNumberOption(value: string | undefined, optionName: string): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  return parsePositiveNumberOption(value, optionName);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatErrorContext(fields: Record<string, unknown>): string {
+  const parts = Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
+    .map(([key, value]) => `${key}=${String(value)}`);
+  return parts.length ? ` (${parts.join(", ")})` : "";
+}
+
+function contextualError(context: string, fields: Record<string, unknown>, error: unknown): Error {
+  return new Error(`${context} failed${formatErrorContext(fields)}: ${errorMessage(error)}`);
 }
 
 function globMatch(text: string, pattern: string): boolean {
@@ -1550,43 +1584,6 @@ async function resolveAccountId(
   throw new Error("Multiple accounts found. Provide --account-id or --account-type.");
 }
 
-async function waitForOrderStatus(
-  token: string,
-  externalId: string,
-  timeoutSeconds = 30,
-  acceptPending = false
-): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + timeoutSeconds * 1000;
-  while (Date.now() < deadline) {
-    let payload: Record<string, unknown>;
-    try {
-      payload = await graphqlRequest(token, "FetchSoOrdersExtendedOrder", FETCH_SO_ORDERS_EXTENDED_ORDER, {
-        branchId: "TR",
-        externalId
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes('"code":"NOT_FOUND"')) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        continue;
-      }
-      throw error;
-    }
-    const order = (payload.data as Record<string, unknown>)?.soOrdersExtendedOrder as Record<string, unknown> | undefined;
-    if (order) {
-      const status = String(order.status ?? "").toLowerCase();
-      if (acceptPending && ["new", "pending", "queued", "accepted", "open", "submitted", "in_progress"].includes(status)) {
-        return order;
-      }
-      if (!["", "new", "pending", "queued", "accepted", "open", "submitted", "in_progress"].includes(status)) {
-        return order;
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  throw new Error(`Order ${externalId} did not finalize in ${timeoutSeconds}s`);
-}
-
 function numericQuantity(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -1630,18 +1627,19 @@ async function resolvePositionQuantity(
   securityId: string,
   symbol: string
 ): Promise<{ liveQuantity: number; fallbackQuantity: number; resolvedQuantity: number; source: "positions" | "history_fallback" }> {
-  const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
-  const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
   const symbolUp = symbol.trim().toUpperCase();
-  const livePosition = (positions as Record<string, unknown>[]).find(
-    (row) => String(row.symbol ?? "").trim().toUpperCase() === symbolUp
-  );
-  const liveQuantity = livePosition ? numericQuantity((livePosition as Record<string, unknown>).quantity) : 0;
   const fallbackQuantity = fallbackQuantityFromHistory(accountId, securityId, symbolUp);
-  if (liveQuantity > 0) {
+  try {
+    const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
+    const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
+    const livePosition = (positions as Record<string, unknown>[]).find(
+      (row) => String(row.symbol ?? "").trim().toUpperCase() === symbolUp
+    );
+    const liveQuantity = livePosition ? numericQuantity((livePosition as Record<string, unknown>).quantity) : 0;
     return { liveQuantity, fallbackQuantity, resolvedQuantity: liveQuantity, source: "positions" };
+  } catch {
+    return { liveQuantity: 0, fallbackQuantity, resolvedQuantity: fallbackQuantity, source: "history_fallback" };
   }
-  return { liveQuantity, fallbackQuantity, resolvedQuantity: fallbackQuantity, source: "history_fallback" };
 }
 
 async function submitAndWaitOrder(
@@ -1682,10 +1680,8 @@ async function submitAndWaitOrder(
     created_at: createdOrder.createdAt ?? null,
     ...logMeta
   });
-  const externalId = String(input.externalId ?? "");
-  const order = await waitForOrderStatus(token, externalId);
-  assertOrderNotRejected(order);
-  return order;
+  assertOrderNotRejected(createdOrder);
+  return createdOrder;
 }
 
 function withGlobalOptions(command: Command): Command {
@@ -2098,14 +2094,14 @@ async function main(): Promise<void> {
       try {
         payload = await tradeRequest(token, "GET", `/securities?query=${encodeURIComponent(query)}`) as Record<string, unknown>;
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorMessage(error);
         if (message.includes("HTTP 404")) {
           throw new Error(
             "Lookup endpoint is currently unavailable for this account/session. " +
             "Use a security id directly or try again later."
           );
         }
-        throw new Error(`Lookup failed: ${message}`);
+        throw contextualError("lookup request", { query, limit }, error);
       }
       const results = Array.isArray(payload.results) ? payload.results.slice(0, limit) : [];
       print(results);
@@ -2155,7 +2151,7 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId,
         cmdOpts.accountType,
-        cmdOpts.accountIndex !== undefined ? Number.parseInt(cmdOpts.accountIndex, 10) : undefined
+        parseOptionalPositiveIntOption(cmdOpts.accountIndex, "--account-index")
       );
       const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
       const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
@@ -2196,10 +2192,7 @@ async function main(): Promise<void> {
       const opts = program.opts<GlobalOptions>();
       const { token, bundle } = await resolveAccessToken(opts);
       const dryRun = cmdOpts.dryRun === true;
-      const amount = Number.parseFloat(String(cmdOpts.amount ?? ""));
-      if (!Number.isFinite(amount) || amount <= 0) {
-        throw new Error("--amount must be a positive number.");
-      }
+      const amount = parsePositiveNumberOption(cmdOpts.amount as string | undefined, "--amount");
       const fromSelector = String(cmdOpts.from ?? "").trim();
       const toSelector = String(cmdOpts.to ?? "").trim();
       const hasFromLegacy =
@@ -2220,7 +2213,7 @@ async function main(): Promise<void> {
           bundle,
           cmdOpts.fromAccountId as string | undefined,
           cmdOpts.fromAccountType as string | undefined,
-          cmdOpts.fromAccountIndex !== undefined ? Number.parseInt(String(cmdOpts.fromAccountIndex), 10) : undefined
+          parseOptionalPositiveIntOption(cmdOpts.fromAccountIndex as string | undefined, "--from-account-index")
         );
       const toAccountId = toSelector
         ? resolveAccountIdBySelector(accounts, toSelector, "--to", aliases)
@@ -2229,7 +2222,7 @@ async function main(): Promise<void> {
           bundle,
           cmdOpts.toAccountId as string | undefined,
           cmdOpts.toAccountType as string | undefined,
-          cmdOpts.toAccountIndex !== undefined ? Number.parseInt(String(cmdOpts.toAccountIndex), 10) : undefined
+          parseOptionalPositiveIntOption(cmdOpts.toAccountIndex as string | undefined, "--to-account-index")
         );
       if (fromAccountId === toAccountId) {
         throw new Error("Source and destination accounts must be different.");
@@ -2280,7 +2273,29 @@ async function main(): Promise<void> {
         MUTATION_FUNDING_INTENT_INTERNAL_TRANSFER_CREATE,
         { input },
         bundle
-      );
+      ).catch((error) => {
+        appendLog({
+          event: "transfer_submit_attempt",
+          status: "error",
+          from_account_id: fromAccountId,
+          to_account_id: toAccountId,
+          amount,
+          destination_currency: destinationCurrency,
+          idempotency_key: idempotencyKey,
+          message: errorMessage(error)
+        });
+        throw contextualError(
+          "transfer submit",
+          {
+            from_account_id: fromAccountId,
+            to_account_id: toAccountId,
+            amount,
+            destination_currency: destinationCurrency,
+            idempotency_key: idempotencyKey
+          },
+          error
+        );
+      });
       const result =
         (payload.data as Record<string, unknown> | undefined)?.createFundingIntentInternalTransfer ??
         (payload.data as Record<string, unknown> | undefined) ??
@@ -2322,7 +2337,7 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId as string | undefined,
         cmdOpts.accountType as string | undefined,
-        cmdOpts.accountIndex !== undefined ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
+        parseOptionalPositiveIntOption(cmdOpts.accountIndex as string | undefined, "--account-index")
       );
       const symbol = String(cmdOpts.symbol ?? target ?? "").trim();
       const securityId = String(cmdOpts.securityId ?? "").trim();
@@ -2339,8 +2354,8 @@ async function main(): Promise<void> {
         throw new Error("Ticker buys require a market: use TSX.SHOP style or pass --market.");
       }
       const resolvedSecurityId = securityId || await resolveSecurityIdArg(token, bundle, requestedSymbol, market);
-      const shares = cmdOpts.shares ? Number.parseFloat(String(cmdOpts.shares)) : undefined;
-      const dollars = cmdOpts.dollars ? Number.parseFloat(String(cmdOpts.dollars)) : undefined;
+      const shares = parseOptionalPositiveNumberOption(cmdOpts.shares as string | undefined, "--shares");
+      const dollars = parseOptionalPositiveNumberOption(cmdOpts.dollars as string | undefined, "--dollars");
       if ((shares === undefined) === (dollars === undefined)) {
         throw new Error("Provide exactly one of --shares or --dollars.");
       }
@@ -2349,8 +2364,8 @@ async function main(): Promise<void> {
       if (!["market", "limit", "stop_limit", "stop_market"].includes(orderStyle)) {
         throw new Error("--order must be market, limit, stop_limit, or stop_market.");
       }
-      const limitPrice = cmdOpts.limitPrice !== undefined ? Number.parseFloat(String(cmdOpts.limitPrice)) : undefined;
-      const stopPrice = cmdOpts.stopPrice !== undefined ? Number.parseFloat(String(cmdOpts.stopPrice)) : undefined;
+      const limitPrice = parseOptionalPositiveNumberOption(cmdOpts.limitPrice as string | undefined, "--limit-price");
+      const stopPrice = parseOptionalPositiveNumberOption(cmdOpts.stopPrice as string | undefined, "--stop-price");
       if (orderStyle === "limit" && (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0)) {
         throw new Error("limit orders require positive --limit-price.");
       }
@@ -2478,7 +2493,39 @@ async function main(): Promise<void> {
         quantity: input.quantity ?? null,
         value: input.value ?? null
       });
-      const createPayload = await graphqlRequest(token, "SoOrdersOrderCreate", MUTATION_SO_ORDERS_ORDER_CREATE, { input }, bundle);
+      const createPayload = await graphqlRequest(
+        token,
+        "SoOrdersOrderCreate",
+        MUTATION_SO_ORDERS_ORDER_CREATE,
+        { input },
+        bundle
+      ).catch((error) => {
+        appendLog({
+          event: "buy_submit_attempt",
+          status: "error",
+          account_id: accountId,
+          security_id: resolvedSecurityId,
+          external_id: externalId,
+          order_style: orderStyle,
+          execution_type: input.executionType,
+          order_type: input.orderType,
+          limit_price: input.limitPrice ?? null,
+          stop_price: input.stopPrice ?? null,
+          quantity: input.quantity ?? null,
+          value: input.value ?? null,
+          message: errorMessage(error)
+        });
+        throw contextualError(
+          "buy submit",
+          {
+            account_id: accountId,
+            security_id: resolvedSecurityId,
+            external_id: externalId,
+            order_style: orderStyle
+          },
+          error
+        );
+      });
       const createData = (createPayload.data as Record<string, unknown> | undefined)?.soOrdersCreateOrder as
         | Record<string, unknown>
         | undefined;
@@ -2508,8 +2555,22 @@ async function main(): Promise<void> {
         order_id: String(createdOrder.orderId ?? ""),
         created_at: createdOrder.createdAt ?? null
       });
-      const order = await waitForOrderStatus(token, externalId, 30, orderStyle === "stop_limit" || orderStyle === "stop_market");
-      assertOrderNotRejected(order);
+      const order = createdOrder;
+      try {
+        assertOrderNotRejected(order);
+      } catch (error) {
+        throw contextualError(
+          "buy order rejection",
+          {
+            account_id: accountId,
+            security_id: resolvedSecurityId,
+            external_id: externalId,
+            order_id: String(order.orderId ?? order.id ?? ""),
+            order_style: orderStyle
+          },
+          error
+        );
+      }
       appendBuyHistory({
         side: "buy",
         status: String(order.status ?? "unknown"),
@@ -2549,7 +2610,7 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId as string | undefined,
         cmdOpts.accountType as string | undefined,
-        cmdOpts.accountIndex !== undefined ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
+        parseOptionalPositiveIntOption(cmdOpts.accountIndex as string | undefined, "--account-index")
       );
       const symbol = String(cmdOpts.symbol ?? target ?? "").trim();
       const securityId = String(cmdOpts.securityId ?? "").trim();
@@ -2569,14 +2630,13 @@ async function main(): Promise<void> {
           throw new Error(`No sellable ${resolvedSymbol} shares found for --sell-all.`);
         }
       } else {
-        shares = Number.parseFloat(String(cmdOpts.shares ?? ""));
-        if (!Number.isFinite(shares) || shares <= 0) throw new Error("--shares must be a positive number.");
+        shares = parsePositiveNumberOption(cmdOpts.shares as string | undefined, "--shares");
       }
       const orderStyle = String(cmdOpts.order ?? "market").trim().toLowerCase();
       if (orderStyle !== "market" && orderStyle !== "limit") {
         throw new Error("--order must be market or limit.");
       }
-      const limitPrice = cmdOpts.limitPrice !== undefined ? Number.parseFloat(String(cmdOpts.limitPrice)) : undefined;
+      const limitPrice = parseOptionalPositiveNumberOption(cmdOpts.limitPrice as string | undefined, "--limit-price");
       if (orderStyle === "limit" && (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0)) {
         throw new Error("limit orders require positive --limit-price.");
       }
@@ -2627,6 +2687,17 @@ async function main(): Promise<void> {
         order_type: input.orderType,
         limit_price: input.limitPrice ?? null,
         quantity: input.quantity ?? null
+      }).catch((error) => {
+        throw contextualError(
+          "sell submit",
+          {
+            account_id: accountId,
+            security_id: resolvedSecurityId,
+            external_id: externalId,
+            order_style: orderStyle
+          },
+          error
+        );
       });
       appendBuyHistory({
         status: String(order.status ?? "unknown"),
@@ -2658,7 +2729,7 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId,
         cmdOpts.accountType,
-        cmdOpts.accountIndex !== undefined ? Number.parseInt(cmdOpts.accountIndex, 10) : undefined
+        parseOptionalPositiveIntOption(cmdOpts.accountIndex, "--account-index")
       );
       const resolvedSecurityId = await resolveSecurityIdArg(token, bundle, target);
       const resolvedSymbol = await resolveSymbolFromSecurityId(token, bundle, resolvedSecurityId);
@@ -2693,22 +2764,16 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId as string | undefined,
         cmdOpts.accountType as string | undefined,
-        cmdOpts.accountIndex !== undefined ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
+        parseOptionalPositiveIntOption(cmdOpts.accountIndex as string | undefined, "--account-index")
       );
-      const shares = Number.parseFloat(String(cmdOpts.shares ?? "1"));
-      if (!Number.isFinite(shares) || shares <= 0 || !Number.isInteger(shares)) {
+      const shares = parsePositiveNumberOption(cmdOpts.shares as string | undefined, "--shares");
+      if (!Number.isInteger(shares)) {
         throw new Error("--shares must be a positive whole number.");
       }
-      const buyLimitPrice = Number.parseFloat(String(cmdOpts.buyLimitPrice ?? ""));
-      if (!Number.isFinite(buyLimitPrice) || buyLimitPrice <= 0) {
-        throw new Error("--buy-limit-price must be positive.");
-      }
+      const buyLimitPrice = parsePositiveNumberOption(cmdOpts.buyLimitPrice as string | undefined, "--buy-limit-price");
       const sellLimitPrice = cmdOpts.sellLimitPrice !== undefined
-        ? Number.parseFloat(String(cmdOpts.sellLimitPrice))
+        ? parsePositiveNumberOption(cmdOpts.sellLimitPrice as string, "--sell-limit-price")
         : buyLimitPrice;
-      if (!Number.isFinite(sellLimitPrice) || sellLimitPrice <= 0) {
-        throw new Error("--sell-limit-price must be positive.");
-      }
       const resolvedSecurityId = await resolveSecurityIdArg(token, bundle, target);
       const resolvedSymbol = await resolveSymbolFromSecurityId(token, bundle, resolvedSecurityId);
       const before = await resolvePositionQuantity(token, bundle, accountId, resolvedSecurityId, resolvedSymbol);
@@ -3025,11 +3090,7 @@ async function main(): Promise<void> {
         print({ cleared_id: targetId, remaining: keep.length });
         return;
       }
-      const parsedLimit = cmdOpts.limit !== undefined ? Number.parseInt(cmdOpts.limit, 10) : undefined;
-      if (parsedLimit !== undefined && (!Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
-        throw new Error("--limit must be a positive integer.");
-      }
-      const limit = parsedLimit;
+      const limit = parseOptionalPositiveIntOption(cmdOpts.limit, "--limit");
       const ensured = ensureHistoryIds(readJsonl(BUY_HISTORY_FILE, Number.MAX_SAFE_INTEGER));
       const rows = ensured.rows;
       if (ensured.updated) writeJsonlRows(BUY_HISTORY_FILE, rows);
@@ -3070,7 +3131,12 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`Error: ${message}`);
+  const message = errorMessage(error);
+  const command = process.argv.slice(2).join(" ").trim();
+  if (command) {
+    console.error(`Error [command="${command}"]: ${message}`);
+  } else {
+    console.error(`Error: ${message}`);
+  }
   process.exit(1);
 });

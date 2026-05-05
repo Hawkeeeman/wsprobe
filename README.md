@@ -1,6 +1,6 @@
 # wsli
 
-`wsli` is a Node 20+ CLI for Wealthsimple account, portfolio, and trading workflows. It supports read-only GraphQL and Trade REST calls for accounts, positions, portfolio, funding, plus `preview-buy`, live `buy`, and `sell`.
+`wsli` is a Node 20+ CLI for Wealthsimple account, portfolio, and trading workflows. It supports read-only GraphQL and Trade REST calls for accounts, positions, portfolio, funding, plus live `buy` and `sell`.
 
 ## Install
 
@@ -33,9 +33,8 @@ The default session file is `~/.config/wsli/session.json`.
 
 ## Safety
 
-- `preview-buy` is read-only.
 - Live `buy` and `sell` commands require explicit flags and should be treated as real brokerage actions.
-- `sell` requires `--confirm`.
+- `buy`, `sell`, `transfer`, and `trade-smoke` require `--confirm` unless using `--dry-run` where supported.
 
 ## Commands
 
@@ -44,9 +43,9 @@ Use `wsli --help` and `wsli <command> --help` for details.
 | Area | Commands |
 |------|----------|
 | Session | `setup`, `snippet`, `import-session`, `config-path`, `session-path`, `ping`, `keepalive` |
-| Market data | `lookup`, `security`, `restrictions` |
+| Market data | `lookup`, `security` |
 | Account | `accounts`, `positions`, `position-for-symbol`, `portfolio` |
-| Orders | `preview-buy` (read-only), `buy` (supports `--order market|limit|stop_limit|stop_market`, with `--stop-price` for stop orders), `sell` (supports `--order market|limit`, `--sell-all`, `--confirm` required), `transfer` (internal account transfer with `--from/--to` selectors, `--confirm` required), `trade-smoke` |
+| Orders | `buy` (supports `--order market|limit|stop_limit|stop_market`, with `--stop-price` for stop orders), `sell` (supports `--order market|limit`, `--sell-all`, `--confirm` required), `transfer` (internal account transfer with `--from/--to` selectors, `--confirm` required), `trade-smoke` |
 | Aliases | `account-alias list`, `account-alias set`, `account-alias remove`, `account-alias-path` |
 | Diagnostics | `logs`, `history` |
 
@@ -68,12 +67,7 @@ Environment variables:
 - `WEALTHSIMPLE_OAUTH_CLIENT_ID`
 - `WSLI_NO_REFRESH=1` or `true` to disable OAuth refresh
 
-For JSON account summaries:
-
-```bash
-wsli accounts --json
-wsli accounts --json --pretty
-```
+`accounts` outputs readable blocks by default. Use `positions`, `position-for-symbol`, `logs --json`, and `history --json` when you need JSON output.
 
 ## From source
 

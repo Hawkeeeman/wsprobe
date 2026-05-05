@@ -27,7 +27,10 @@
     "build": "tsc -p tsconfig.json",
     "wsli": "node ./wsli.mjs",
     "dev": "tsx src/index.ts",
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "lint": "npm run check",
+    "test": "node --test test/cli-smoke.test.mjs",
+    "ci": "npm run lint && npm run test && npm run check && npm run build"
   },
   "engines": {
     "node": ">=20"
