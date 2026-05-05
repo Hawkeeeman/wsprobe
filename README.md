@@ -45,8 +45,9 @@ Use `wsli --help` and `wsli <command> --help` for details.
 |------|----------|
 | Session | `setup`, `snippet`, `import-session`, `config-path`, `session-path`, `ping`, `keepalive` |
 | Market data | `lookup`, `security`, `restrictions` |
-| Account | `accounts`, `positions`, `position-for-symbol`, `portfolio`, `funding` |
-| Orders | `preview-buy` (read-only), `buy` (supports `--order market|limit|stop_limit|stop_market`, with `--stop-price` for stop orders), `sell` (supports `--order market|limit`, `--sell-all`, `--confirm` required), `trade-smoke` |
+| Account | `accounts`, `positions`, `position-for-symbol`, `portfolio` |
+| Orders | `preview-buy` (read-only), `buy` (supports `--order market|limit|stop_limit|stop_market`, with `--stop-price` for stop orders), `sell` (supports `--order market|limit`, `--sell-all`, `--confirm` required), `transfer` (internal account transfer with `--from/--to` selectors, `--confirm` required), `trade-smoke` |
+| Aliases | `account-alias list`, `account-alias set`, `account-alias remove`, `account-alias-path` |
 | Diagnostics | `logs`, `history` |
 
 For `buy --order limit`, `buy --order stop_limit`, and `buy --order stop_market`, use whole shares with `--shares`. Stop-limit requires both `--stop-price` and `--limit-price`; stop-market requires only `--stop-price`.

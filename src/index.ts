@@ -18,6 +18,7 @@ const DEFAULT_OAUTH_CLIENT_ID = "4da53ac2b03225bed1550eba8e4611e086c7b905a3855e6
 const CONFIG_DIR = path.join(os.homedir(), ".config", "wsli");
 const SESSION_FILE = path.join(CONFIG_DIR, "session.json");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+const ACCOUNT_ALIASES_FILE = path.join(CONFIG_DIR, "account_aliases.json");
 const LOG_FILE = path.join(CONFIG_DIR, "logs.jsonl");
 const BUY_HISTORY_FILE = path.join(CONFIG_DIR, "buy_history.jsonl");
 const KEEPALIVE_PID_FILE = path.join(CONFIG_DIR, "keepalive.pid");
@@ -149,6 +150,18 @@ mutation SoOrdersOrderCreate($input: SoOrders_CreateOrderInput!) {
   soOrdersCreateOrder(input: $input) {
     errors { code message __typename }
     order { orderId createdAt __typename }
+    __typename
+  }
+}
+`;
+
+const MUTATION_FUNDING_INTENT_INTERNAL_TRANSFER_CREATE = `
+mutation FundingIntentInternalTransferCreate($input: CreateFundingIntentInternalTransferInput!) {
+  createFundingIntentInternalTransfer: create_funding_intent_internal_transfer(input: $input) {
+    ... on FundingIntent {
+      id
+      __typename
+    }
     __typename
   }
 }
@@ -334,6 +347,7 @@ function readJsonl(filePath: string, limit: number): Record<string, unknown>[] {
 function appendLog(entry: Record<string, unknown>): void {
   writeJsonl(LOG_FILE, {
     ts_utc: new Date().toISOString(),
+    log_id: `log-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`,
     session_id: SESSION_ID,
     level: "info",
     ...entry
@@ -739,6 +753,18 @@ function parseSinceSeconds(value: string): number | null {
   return qty * mult[unit];
 }
 
+function parsePositiveIntOption(value: string | undefined, optionName: string, defaultValue?: number): number {
+  if (value === undefined || value === "") {
+    if (defaultValue !== undefined) return defaultValue;
+    throw new Error(`${optionName} is required.`);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${optionName} must be a positive integer.`);
+  }
+  return parsed;
+}
+
 function globMatch(text: string, pattern: string): boolean {
   const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`).test(text);
@@ -866,6 +892,123 @@ function formatHistoryEntry(row: Record<string, unknown>, index: number, account
   const rejection = String(row.rejection_message ?? row.rejection_cause ?? "").trim();
   if (rejection) lines.push(`Reason: ${rejection}`);
   return lines.join("\n");
+}
+
+function formatLogEntry(row: Record<string, unknown>, index: number): string {
+  const logId = String(row.log_id ?? "").trim();
+  const event = String(row.event ?? "unknown").trim() || "unknown";
+  const tsUtc = String(row.ts_utc ?? "");
+  const tsLabel = formatLocalTime(tsUtc);
+  const age = formatAge(tsUtc);
+  const level = String(row.level ?? "").trim().toLowerCase();
+  const status = String(row.status ?? "").trim();
+  const symbol = String(row.symbol ?? "").trim().toUpperCase();
+  const message = String(row.message ?? "").trim();
+  const code = String(row.rejection_code ?? "").trim();
+  const accountId = String(row.account_id ?? "").trim();
+  const sessionId = String(row.session_id ?? "").trim();
+  const securityId = String(row.security_id ?? "").trim();
+  const orderId = String(row.order_id ?? "").trim();
+  const externalId = String(row.external_id ?? "").trim();
+  const side = String(row.side ?? "").trim();
+  const orderStyle = String(row.order_style ?? "").trim();
+  const orderType = String(row.order_type ?? "").trim();
+  const executionType = String(row.execution_type ?? "").trim();
+  const quantity = Number(row.quantity ?? row.submitted_quantity);
+  const value = Number(row.value ?? row.submitted_value);
+  const limitPrice = Number(row.limit_price);
+  const stopPrice = Number(row.stop_price);
+  const filledQty = Number(row.filled_quantity);
+  const avgFillPrice = Number(row.average_filled_price);
+  const expiresIn = Number(row.expires_in);
+  const nextProbeMs = Number(row.next_probe_ms);
+  const coreKeys = new Set([
+    "log_id",
+    "ts_utc",
+    "event",
+    "status",
+    "level",
+    "message",
+    "rejection_code",
+    "symbol",
+    "account_id",
+    "session_id",
+    "security_id",
+    "order_id",
+    "external_id",
+    "side",
+    "order_style",
+    "order_type",
+    "execution_type",
+    "quantity",
+    "submitted_quantity",
+    "value",
+    "submitted_value",
+    "limit_price",
+    "stop_price",
+    "filled_quantity",
+    "average_filled_price",
+    "expires_in",
+    "next_probe_ms"
+  ]);
+  const extraLines = Object.entries(row)
+    .filter(([key, value]) => !coreKeys.has(key) && value !== null && value !== undefined && String(value).trim() !== "")
+    .map(([key, value]) => {
+      if (typeof value === "object") return `  ${key}: ${JSON.stringify(value)}`;
+      return `  ${key}: ${String(value)}`;
+    });
+  const lines: string[] = [];
+  lines.push(`Log ${index + 1}`);
+  if (logId) lines.push(`ID: ${logId}`);
+  lines.push(`Time: ${tsLabel}${age ? ` (${age})` : ""}`);
+  lines.push(`Event: ${titleCase(event)}`);
+  if (status) lines.push(`Status: ${displayStatus(status)}`);
+  if (level) lines.push(`Level: ${titleCase(level)}`);
+  if (sessionId) lines.push(`Session: ${sessionId}`);
+  if (symbol) lines.push(`Symbol: ${symbol}`);
+  if (accountId) lines.push(`Account: ${accountId}`);
+  if (securityId) lines.push(`Security: ${securityId}`);
+  if (side || orderStyle || orderType || executionType) {
+    const tradeParts = [
+      side ? titleCase(side) : "",
+      orderStyle ? titleCase(orderStyle) : "",
+      orderType ? titleCase(orderType) : "",
+      executionType ? titleCase(executionType) : ""
+    ].filter(Boolean);
+    lines.push(`Trade: ${tradeParts.join(" | ")}`);
+  }
+  if (Number.isFinite(quantity) && quantity > 0) lines.push(`Quantity: ${formatQuantity(quantity)}`);
+  if (Number.isFinite(value) && value > 0) lines.push(`Value: ${value.toFixed(2)}`);
+  if (Number.isFinite(limitPrice) && limitPrice > 0) lines.push(`Limit: ${limitPrice.toFixed(2)}`);
+  if (Number.isFinite(stopPrice) && stopPrice > 0) lines.push(`Stop: ${stopPrice.toFixed(2)}`);
+  if (Number.isFinite(filledQty) && filledQty > 0) {
+    const fill = Number.isFinite(avgFillPrice) && avgFillPrice > 0
+      ? `${formatQuantity(filledQty)} @ ${avgFillPrice.toFixed(2)}`
+      : formatQuantity(filledQty);
+    lines.push(`Fill: ${fill}`);
+  }
+  if (Number.isFinite(expiresIn) && expiresIn >= 0) lines.push(`Expires In: ${Math.floor(expiresIn)}s`);
+  if (Number.isFinite(nextProbeMs) && nextProbeMs >= 0) lines.push(`Next Probe: ${Math.floor(nextProbeMs / 1000)}s`);
+  if (orderId) lines.push(`Order ID: ${orderId}`);
+  if (externalId) lines.push(`External ID: ${externalId}`);
+  if (code) lines.push(`Code: ${code}`);
+  if (message) lines.push(`Message: ${message}`);
+  if (extraLines.length) lines.push(`Details:\n${extraLines.join("\n")}`);
+  return lines.join("\n");
+}
+
+function ensureLogIds(rows: Record<string, unknown>[]): { rows: Record<string, unknown>[]; updated: boolean } {
+  let updated = false;
+  const normalized = rows.map((row) => {
+    const existing = String(row.log_id ?? "").trim();
+    if (existing) return row;
+    updated = true;
+    return {
+      ...row,
+      log_id: `log-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`
+    };
+  });
+  return { rows: normalized, updated };
 }
 
 async function listAccounts(token: string, bundle: OAuthBundle): Promise<Record<string, unknown>[]> {
@@ -1124,6 +1267,117 @@ function normalizeAccountTypeSelector(value: string): string[] {
   return [`ca_${clean}`];
 }
 
+function normalizeAccountSelectorText(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function readAccountAliases(): Record<string, string> {
+  if (!existsSync(ACCOUNT_ALIASES_FILE)) return {};
+  try {
+    const raw = readJsonFile(ACCOUNT_ALIASES_FILE);
+    if (!raw || typeof raw !== "object") return {};
+    const out: Record<string, string> = {};
+    for (const [accountId, alias] of Object.entries(raw as Record<string, unknown>)) {
+      const id = String(accountId ?? "").trim();
+      const label = String(alias ?? "").trim();
+      if (!id || !label) continue;
+      out[id] = label;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeAccountAliases(aliases: Record<string, string>): void {
+  writeJsonFile(ACCOUNT_ALIASES_FILE, aliases);
+}
+
+function normalizeAlias(value: string): string {
+  return normalizeAccountSelectorText(value);
+}
+
+function selectorAliases(selector: string): string[] {
+  const normalized = normalizeAccountSelectorText(selector);
+  const aliasMap: Record<string, string[]> = {
+    tfsa: ["tfsa"],
+    rrsp: ["rrsp"],
+    fhsa: ["fhsa"],
+    resp: ["resp"],
+    rrif: ["rrif"],
+    lira: ["lira"],
+    lrsp: ["lrsp"],
+    joint: ["joint"],
+    nonregistered: ["nonregistered", "nonreg", "nonregisteredaccount", "personal"],
+    chequing: ["chequing", "checking", "cash", "spend"],
+    cash: ["cash", "chequing", "checking", "spend"]
+  };
+  return Object.entries(aliasMap)
+    .filter(([, variants]) => variants.includes(normalized))
+    .map(([key]) => key);
+}
+
+function accountMatchesSelector(account: Record<string, unknown>, selector: string): boolean {
+  const normalizedSelector = normalizeAccountSelectorText(selector);
+  if (!normalizedSelector) return false;
+  const accountId = String(account.id ?? "");
+  if (accountId === selector.trim()) return true;
+  const accountType = String(account.account_type ?? "");
+  const unified = String(account.unified_account_type ?? "").toUpperCase();
+  const nickname = String(account.nickname ?? "");
+  const candidates = [
+    accountId,
+    accountType,
+    unified,
+    nickname,
+    accountType.replace(/^ca_/, ""),
+    unified.replace(/^SELF_DIRECTED_/, "")
+  ].map(normalizeAccountSelectorText);
+  if (candidates.some((value) => value === normalizedSelector)) return true;
+  const aliasKeys = selectorAliases(selector);
+  if (!aliasKeys.length) return false;
+  if (aliasKeys.includes("chequing") || aliasKeys.includes("cash")) {
+    if (unified === "CASH") return true;
+  }
+  if (aliasKeys.includes("nonregistered")) {
+    if (unified.includes("NON_REGISTERED") || accountType === "ca_non_registered") return true;
+  }
+  for (const key of aliasKeys) {
+    if (key === "chequing" || key === "cash" || key === "nonregistered") continue;
+    if (unified.includes(key.toUpperCase()) || accountType.includes(key)) return true;
+  }
+  return false;
+}
+
+function resolveAccountIdBySelector(
+  accounts: Record<string, unknown>[],
+  selector: string,
+  optionName: string,
+  aliases?: Record<string, string>
+): string {
+  const query = selector.trim();
+  if (!query) throw new Error(`${optionName} cannot be empty.`);
+  const normalizedQuery = normalizeAlias(query);
+  if (aliases && normalizedQuery) {
+    const aliasMatches = Object.entries(aliases)
+      .filter(([, alias]) => normalizeAlias(alias) === normalizedQuery)
+      .map(([accountId]) => accountId);
+    if (aliasMatches.length === 1) return aliasMatches[0];
+    if (aliasMatches.length > 1) {
+      throw new Error(`Alias '${selector}' maps to multiple accounts in ${ACCOUNT_ALIASES_FILE}.`);
+    }
+  }
+  const matches = accounts.filter((account) => accountMatchesSelector(account, query));
+  if (!matches.length) {
+    throw new Error(`No account matches ${optionName} '${selector}'. Run 'wsli accounts' to see available accounts.`);
+  }
+  if (matches.length > 1) {
+    const ids = matches.map((account) => String(account.id ?? "")).join(", ");
+    throw new Error(`Multiple accounts match ${optionName} '${selector}': ${ids}. Use explicit --from-account-id/--to-account-id.`);
+  }
+  return String(matches[0].id ?? "");
+}
+
 function normalizeSecurityId(raw: string): string {
   const value = (raw ?? "").trim();
   if (!value) throw new Error("security_id is required (expected sec-s-...)");
@@ -1266,6 +1520,12 @@ async function resolveAccountId(
   accountType?: string,
   accountIndex?: number
 ): Promise<string> {
+  if (accountId && (accountType || accountIndex !== undefined)) {
+    throw new Error("Use either --account-id or (--account-type with optional --account-index), not both.");
+  }
+  if (accountIndex !== undefined && !accountType) {
+    throw new Error("--account-index requires --account-type.");
+  }
   const accounts = await listAccounts(token, bundle);
   if (accountId) {
     const row = accounts.find((account) => String(account.id ?? "") === accountId);
@@ -1439,7 +1699,7 @@ async function main(): Promise<void> {
   const program = withGlobalOptions(new Command())
     .name("wsli")
     .description(
-      "Wealthsimple CLI: read-only GraphQL plus Trade REST (accounts, portfolio, funding, preview-buy, market buy/sell with --confirm)."
+      "Wealthsimple CLI: read-only GraphQL plus Trade REST (accounts, portfolio, market buy/sell with --confirm, plus --dry-run)."
     )
     .version(VERSION);
 
@@ -1450,6 +1710,94 @@ async function main(): Promise<void> {
   program.command("session-path").action(() => {
     console.log(SESSION_FILE);
   });
+
+  program.command("account-alias-path").action(() => {
+    console.log(ACCOUNT_ALIASES_FILE);
+  });
+
+  program
+    .command("account-alias")
+    .description("Manage local account aliases used by transfer selectors.")
+    .addCommand(
+      new Command("list")
+        .description("List local account aliases.")
+        .option("--json", "Output JSON")
+        .action(async (cmdOpts: { json?: boolean }) => {
+          const aliases = readAccountAliases();
+          const entries = Object.entries(aliases)
+            .map(([account_id, alias]) => ({ account_id, alias }))
+            .sort((a, b) => a.alias.localeCompare(b.alias));
+          if (cmdOpts.json) {
+            print({ path: ACCOUNT_ALIASES_FILE, aliases: entries });
+            return;
+          }
+          if (!entries.length) {
+            console.log("No account aliases set.");
+            return;
+          }
+          const lines = [`Aliases (${entries.length})`];
+          for (const row of entries) {
+            lines.push(`${row.alias} -> ${row.account_id}`);
+          }
+          console.log(lines.join("\n"));
+        })
+    )
+    .addCommand(
+      new Command("set")
+        .description("Set or replace alias for an account.")
+        .argument("<account-selector>", "Account id, alias, nickname, or type selector")
+        .argument("<alias>", "Alias label (must be unique)")
+        .action(async (accountSelector: string, alias: string) => {
+          const aliasText = alias.trim();
+          if (!aliasText) throw new Error("Alias cannot be empty.");
+          const aliasKey = normalizeAlias(aliasText);
+          if (!aliasKey) throw new Error("Alias must contain letters or numbers.");
+          const opts = program.opts<GlobalOptions>();
+          const { token, bundle } = await resolveAccessToken(opts);
+          const accounts = await listAccounts(token, bundle);
+          const aliases = readAccountAliases();
+          const accountId = resolveAccountIdBySelector(accounts, accountSelector, "<account-selector>", aliases);
+          for (const [existingId, existingAlias] of Object.entries(aliases)) {
+            if (existingId === accountId) continue;
+            if (normalizeAlias(existingAlias) === aliasKey) {
+              throw new Error(`Alias '${aliasText}' is already used by account ${existingId}.`);
+            }
+          }
+          aliases[accountId] = aliasText;
+          writeAccountAliases(aliases);
+          print({ saved: true, account_id: accountId, alias: aliasText, path: ACCOUNT_ALIASES_FILE });
+        })
+    )
+    .addCommand(
+      new Command("remove")
+        .description("Remove alias by alias text or account selector.")
+        .argument("<alias-or-account>", "Alias label or account selector")
+        .action(async (aliasOrAccount: string) => {
+          const aliases = readAccountAliases();
+          const raw = aliasOrAccount.trim();
+          if (!raw) throw new Error("<alias-or-account> cannot be empty.");
+          const normalized = normalizeAlias(raw);
+          let accountId = Object.entries(aliases)
+            .find(([, alias]) => normalizeAlias(alias) === normalized)?.[0];
+          if (!accountId) {
+            const opts = program.opts<GlobalOptions>();
+            const { token, bundle } = await resolveAccessToken(opts);
+            const accounts = await listAccounts(token, bundle);
+            try {
+              accountId = resolveAccountIdBySelector(accounts, raw, "<alias-or-account>", aliases);
+            } catch {
+              accountId = undefined;
+            }
+          }
+          if (!accountId || !aliases[accountId]) {
+            throw new Error(`No alias found for '${aliasOrAccount}'.`);
+          }
+          const removedAlias = aliases[accountId];
+          delete aliases[accountId];
+          writeAccountAliases(aliases);
+          print({ removed: true, account_id: accountId, alias: removedAlias, path: ACCOUNT_ALIASES_FILE });
+        })
+    );
 
   const runSetup = async (): Promise<void> => {
     console.error("Step 1: Open https://my.wealthsimple.com and sign in.");
@@ -1743,10 +2091,22 @@ async function main(): Promise<void> {
     .argument("<query>", "Ticker or search text")
     .option("--limit <n>", "Max rows", "20")
     .action(async (query: string, cmdOpts: { limit: string }) => {
+      const limit = Math.min(50, parsePositiveIntOption(cmdOpts.limit, "--limit", 20));
       const opts = program.opts<GlobalOptions>();
       const { token } = await resolveAccessToken(opts);
-      const limit = Math.max(1, Math.min(50, Number.parseInt(cmdOpts.limit, 10) || 20));
-      const payload = await tradeRequest(token, "GET", `/securities?query=${encodeURIComponent(query)}`) as Record<string, unknown>;
+      let payload: Record<string, unknown>;
+      try {
+        payload = await tradeRequest(token, "GET", `/securities?query=${encodeURIComponent(query)}`) as Record<string, unknown>;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("HTTP 404")) {
+          throw new Error(
+            "Lookup endpoint is currently unavailable for this account/session. " +
+            "Use a security id directly or try again later."
+          );
+        }
+        throw new Error(`Lookup failed: ${message}`);
+      }
       const results = Array.isArray(payload.results) ? payload.results.slice(0, limit) : [];
       print(results);
     });
@@ -1783,86 +2143,6 @@ async function main(): Promise<void> {
     });
 
   program
-    .command("preview-buy")
-    .argument("[securityOrQuery]", "Security id or ticker/query")
-    .option("--symbol <ticker>", "Ticker/search text instead of positional arg")
-    .requiredOption("--shares <n>", "Share quantity")
-    .option("--order <type>", "market, limit, stop_limit, or stop_market", "market")
-    .option("--limit-price <n>", "Required when --order limit")
-    .option("--stop-price <n>", "Required when --order stop_limit")
-    .option("--assume-price <n>", "Informational notional estimate only")
-    .action(async (securityOrQuery: string | undefined, cmdOpts: Record<string, string | undefined>) => {
-      const opts = program.opts<GlobalOptions>();
-      const { token, bundle } = await resolveAccessToken(opts);
-      if (securityOrQuery && cmdOpts.symbol) throw new Error("Use either positional security/query or --symbol, not both.");
-      const chosen = String(cmdOpts.symbol ?? securityOrQuery ?? "").trim();
-      if (!chosen) throw new Error("Provide security id/search query or --symbol.");
-      const shares = Number.parseFloat(String(cmdOpts.shares ?? ""));
-      if (!Number.isFinite(shares) || shares <= 0) throw new Error("--shares must be positive");
-      const orderRaw = String(cmdOpts.order ?? "market").toLowerCase().replace("-", "_");
-      const order = orderRaw === "stoplimit" ? "stop_limit" : orderRaw;
-      const limitPrice = cmdOpts.limitPrice !== undefined ? Number.parseFloat(String(cmdOpts.limitPrice)) : undefined;
-      const stopPrice = cmdOpts.stopPrice !== undefined ? Number.parseFloat(String(cmdOpts.stopPrice)) : undefined;
-      if (!["market", "limit", "stop_limit", "stop_market"].includes(order)) {
-        throw new Error("--order must be market, limit, stop_limit, or stop_market.");
-      }
-      if (order === "limit" && (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0)) {
-        throw new Error("limit orders require positive --limit-price");
-      }
-      if (order === "stop_limit") {
-        if (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0) {
-          throw new Error("stop_limit orders require positive --limit-price");
-        }
-        if (stopPrice === undefined || !Number.isFinite(stopPrice) || stopPrice <= 0) {
-          throw new Error("stop_limit orders require positive --stop-price");
-        }
-      }
-      if (order === "stop_market") {
-        if (stopPrice === undefined || !Number.isFinite(stopPrice) || stopPrice <= 0) {
-          throw new Error("stop_market orders require positive --stop-price");
-        }
-        if (limitPrice !== undefined) {
-          throw new Error("--limit-price is not used with --order stop_market");
-        }
-      }
-      const sid = await resolveSecurityIdArg(token, bundle, chosen);
-      const securityPayload = await graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId: sid }, bundle);
-      let restrictionsPayload: Record<string, unknown> | null = null;
-      let restrictionsWarning: string | null = null;
-      try {
-        restrictionsPayload = await graphqlRequest(token, "FetchSoOrdersLimitOrderRestrictions", FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS, {
-          args: { securityId: sid, side: "BUY" }
-        }, bundle);
-      } catch (error) {
-        restrictionsWarning = error instanceof Error ? error.message : String(error);
-      }
-      const out = {
-        preview_only: true,
-        no_submit: true,
-        intent: {
-          side: "BUY",
-          order_type: order.toUpperCase(),
-          shares,
-          security_id: sid,
-          limit_price: limitPrice ?? null,
-          stop_price: stopPrice ?? null,
-          assumed_price_per_share_usd: cmdOpts.assumePrice ? Number.parseFloat(String(cmdOpts.assumePrice)) : null
-        },
-        result: {
-          security_ok: true,
-          restrictions_ok: restrictionsPayload !== null,
-          ready_for_real_buy_command: true
-        },
-        graphql: {
-          security: securityPayload,
-          restrictions: restrictionsPayload
-        },
-        warnings: restrictionsWarning ? [restrictionsWarning] : []
-      };
-      print(out);
-    });
-
-  program
     .command("positions")
     .option("--account-id <id>")
     .option("--account-type <type>")
@@ -1875,7 +2155,7 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId,
         cmdOpts.accountType,
-        cmdOpts.accountIndex ? Number.parseInt(cmdOpts.accountIndex, 10) : undefined
+        cmdOpts.accountIndex !== undefined ? Number.parseInt(cmdOpts.accountIndex, 10) : undefined
       );
       const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
       const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
@@ -1898,6 +2178,126 @@ async function main(): Promise<void> {
   });
 
   program
+    .command("transfer")
+    .description("Transfer cash between Wealthsimple accounts.")
+    .requiredOption("--amount <n>", "Amount to transfer")
+    .option("--currency <code>", "Destination currency (defaults to CAD)", "CAD")
+    .option("--from <selector>", "Source account selector (e.g., chequing, tfsa, non-registered, or account id)")
+    .option("--from-account-id <id>")
+    .option("--from-account-type <type>")
+    .option("--from-account-index <n>")
+    .option("--to <selector>", "Destination account selector (e.g., tfsa, chequing, non-registered, or account id)")
+    .option("--to-account-id <id>")
+    .option("--to-account-type <type>")
+    .option("--to-account-index <n>")
+    .option("--dry-run", "Validate inputs and show payload without submitting")
+    .option("--confirm", "Required safety latch")
+    .action(async (cmdOpts: Record<string, string | boolean | undefined>) => {
+      const opts = program.opts<GlobalOptions>();
+      const { token, bundle } = await resolveAccessToken(opts);
+      const dryRun = cmdOpts.dryRun === true;
+      const amount = Number.parseFloat(String(cmdOpts.amount ?? ""));
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error("--amount must be a positive number.");
+      }
+      const fromSelector = String(cmdOpts.from ?? "").trim();
+      const toSelector = String(cmdOpts.to ?? "").trim();
+      const hasFromLegacy =
+        cmdOpts.fromAccountId !== undefined || cmdOpts.fromAccountType !== undefined || cmdOpts.fromAccountIndex !== undefined;
+      const hasToLegacy = cmdOpts.toAccountId !== undefined || cmdOpts.toAccountType !== undefined || cmdOpts.toAccountIndex !== undefined;
+      if (fromSelector && hasFromLegacy) {
+        throw new Error("Use either --from or --from-account-* options, not both.");
+      }
+      if (toSelector && hasToLegacy) {
+        throw new Error("Use either --to or --to-account-* options, not both.");
+      }
+      const accounts = await listAccounts(token, bundle);
+      const aliases = readAccountAliases();
+      const fromAccountId = fromSelector
+        ? resolveAccountIdBySelector(accounts, fromSelector, "--from", aliases)
+        : await resolveAccountId(
+          token,
+          bundle,
+          cmdOpts.fromAccountId as string | undefined,
+          cmdOpts.fromAccountType as string | undefined,
+          cmdOpts.fromAccountIndex !== undefined ? Number.parseInt(String(cmdOpts.fromAccountIndex), 10) : undefined
+        );
+      const toAccountId = toSelector
+        ? resolveAccountIdBySelector(accounts, toSelector, "--to", aliases)
+        : await resolveAccountId(
+          token,
+          bundle,
+          cmdOpts.toAccountId as string | undefined,
+          cmdOpts.toAccountType as string | undefined,
+          cmdOpts.toAccountIndex !== undefined ? Number.parseInt(String(cmdOpts.toAccountIndex), 10) : undefined
+        );
+      if (fromAccountId === toAccountId) {
+        throw new Error("Source and destination accounts must be different.");
+      }
+      const destinationCurrency = String(cmdOpts.currency ?? "CAD").trim().toUpperCase();
+      if (!destinationCurrency) {
+        throw new Error("--currency cannot be empty.");
+      }
+      const idempotencyKey = `transfer-${crypto.randomUUID()}`;
+      const input: Record<string, unknown> = {
+        source: { id: fromAccountId, type: "Account" },
+        destination: { id: toAccountId, type: "Account" },
+        requested_amount_unit: "QUANTITY",
+        requested_amount_value: String(amount),
+        source_currency: destinationCurrency,
+        destination_currency: destinationCurrency,
+        product_attribution: "simple_mm_web",
+        idempotency_key: idempotencyKey
+      };
+      if (dryRun) {
+        print({
+          dry_run: true,
+          no_submit: true,
+          ready_for_submit: true,
+          intent: {
+            from_account_id: fromAccountId,
+            to_account_id: toAccountId,
+            amount,
+            destination_currency: destinationCurrency
+          },
+          mutation_input: input
+        });
+        return;
+      }
+      if (!cmdOpts.confirm) throw new Error("Missing --confirm safety latch.");
+      appendLog({
+        event: "transfer_submit_attempt",
+        status: "start",
+        from_account_id: fromAccountId,
+        to_account_id: toAccountId,
+        amount,
+        destination_currency: destinationCurrency,
+        idempotency_key: idempotencyKey
+      });
+      const payload = await graphqlRequest(
+        token,
+        "FundingIntentInternalTransferCreate",
+        MUTATION_FUNDING_INTENT_INTERNAL_TRANSFER_CREATE,
+        { input },
+        bundle
+      );
+      const result =
+        (payload.data as Record<string, unknown> | undefined)?.createFundingIntentInternalTransfer ??
+        (payload.data as Record<string, unknown> | undefined) ??
+        payload;
+      appendLog({
+        event: "transfer_submit_attempt",
+        status: "accepted",
+        from_account_id: fromAccountId,
+        to_account_id: toAccountId,
+        amount,
+        destination_currency: destinationCurrency,
+        idempotency_key: idempotencyKey
+      });
+      print(result);
+    });
+
+  program
     .command("buy")
     .argument("[target]", "Ticker or security id")
     .option("--symbol <ticker>")
@@ -1911,17 +2311,18 @@ async function main(): Promise<void> {
     .option("--account-id <id>")
     .option("--account-type <type>")
     .option("--account-index <n>")
+    .option("--dry-run", "Validate inputs and show order payload without submitting")
     .option("--confirm", "Required safety latch")
     .action(async (target: string | undefined, cmdOpts: Record<string, string | boolean | undefined>) => {
-      if (!cmdOpts.confirm) throw new Error("Missing --confirm safety latch.");
       const opts = program.opts<GlobalOptions>();
       const { token, bundle } = await resolveAccessToken(opts);
+      const dryRun = cmdOpts.dryRun === true;
       const accountId = await resolveAccountId(
         token,
         bundle,
         cmdOpts.accountId as string | undefined,
         cmdOpts.accountType as string | undefined,
-        cmdOpts.accountIndex ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
+        cmdOpts.accountIndex !== undefined ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
       );
       const symbol = String(cmdOpts.symbol ?? target ?? "").trim();
       const securityId = String(cmdOpts.securityId ?? "").trim();
@@ -2026,6 +2427,42 @@ async function main(): Promise<void> {
       if (dollars !== undefined) input.value = dollars;
       if (limitPrice !== undefined) input.limitPrice = limitPrice;
       if (stopPrice !== undefined) input.stopPrice = stopPrice;
+      if (dryRun) {
+        const securityPayload = await graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId: resolvedSecurityId }, bundle);
+        let restrictionsPayload: Record<string, unknown> | null = null;
+        let restrictionsWarning: string | null = null;
+        try {
+          restrictionsPayload = await graphqlRequest(token, "FetchSoOrdersLimitOrderRestrictions", FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS, {
+            args: { securityId: resolvedSecurityId, side: "BUY" }
+          }, bundle);
+        } catch (error) {
+          restrictionsWarning = error instanceof Error ? error.message : String(error);
+        }
+        print({
+          dry_run: true,
+          no_submit: true,
+          ready_for_submit: true,
+          intent: {
+            side: "BUY",
+            symbol: requestedSymbol || null,
+            security_id: resolvedSecurityId,
+            account_id: accountId,
+            order_style: orderStyle,
+            shares: shares ?? null,
+            dollars: dollars ?? null,
+            limit_price: limitPrice ?? null,
+            stop_price: stopPrice ?? null
+          },
+          order_input: input,
+          graphql: {
+            security: securityPayload,
+            restrictions: restrictionsPayload
+          },
+          warnings: restrictionsWarning ? [restrictionsWarning] : []
+        });
+        return;
+      }
+      if (!cmdOpts.confirm) throw new Error("Missing --confirm safety latch.");
       appendLog({
         event: "buy_submit_attempt",
         status: "start",
@@ -2101,17 +2538,18 @@ async function main(): Promise<void> {
     .option("--account-id <id>")
     .option("--account-type <type>")
     .option("--account-index <n>")
+    .option("--dry-run", "Validate inputs and show order payload without submitting")
     .option("--confirm", "Required safety latch")
     .action(async (target: string | undefined, cmdOpts: Record<string, string | boolean | undefined>) => {
-      if (!cmdOpts.confirm) throw new Error("Missing --confirm safety latch.");
       const opts = program.opts<GlobalOptions>();
       const { token, bundle } = await resolveAccessToken(opts);
+      const dryRun = cmdOpts.dryRun === true;
       const accountId = await resolveAccountId(
         token,
         bundle,
         cmdOpts.accountId as string | undefined,
         cmdOpts.accountType as string | undefined,
-        cmdOpts.accountIndex ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
+        cmdOpts.accountIndex !== undefined ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
       );
       const symbol = String(cmdOpts.symbol ?? target ?? "").trim();
       const securityId = String(cmdOpts.securityId ?? "").trim();
@@ -2160,6 +2598,26 @@ async function main(): Promise<void> {
       if (shares !== undefined) input.quantity = shares;
       if (orderStyle === "limit") input.tradingSession = "REGULAR";
       if (limitPrice !== undefined) input.limitPrice = limitPrice;
+      if (dryRun) {
+        print({
+          dry_run: true,
+          no_submit: true,
+          ready_for_submit: true,
+          intent: {
+            side: "SELL",
+            symbol: resolvedSymbol,
+            security_id: resolvedSecurityId,
+            account_id: accountId,
+            sell_all: sellAll,
+            order_style: orderStyle,
+            shares,
+            limit_price: limitPrice ?? null
+          },
+          order_input: input
+        });
+        return;
+      }
+      if (!cmdOpts.confirm) throw new Error("Missing --confirm safety latch.");
       const order = await submitAndWaitOrder(token, bundle, input, "sell_submit_attempt", {
         account_id: accountId,
         security_id: resolvedSecurityId,
@@ -2200,7 +2658,7 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId,
         cmdOpts.accountType,
-        cmdOpts.accountIndex ? Number.parseInt(cmdOpts.accountIndex, 10) : undefined
+        cmdOpts.accountIndex !== undefined ? Number.parseInt(cmdOpts.accountIndex, 10) : undefined
       );
       const resolvedSecurityId = await resolveSecurityIdArg(token, bundle, target);
       const resolvedSymbol = await resolveSymbolFromSecurityId(token, bundle, resolvedSecurityId);
@@ -2235,7 +2693,7 @@ async function main(): Promise<void> {
         bundle,
         cmdOpts.accountId as string | undefined,
         cmdOpts.accountType as string | undefined,
-        cmdOpts.accountIndex ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
+        cmdOpts.accountIndex !== undefined ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
       );
       const shares = Number.parseFloat(String(cmdOpts.shares ?? "1"));
       if (!Number.isFinite(shares) || shares <= 0 || !Number.isInteger(shares)) {
@@ -2365,12 +2823,41 @@ async function main(): Promise<void> {
   program
     .command("logs")
     .option("--limit <n>", "Show last N rows", "50")
+    .option("--all", "Show all log rows")
     .option("--level <level>", "Filter level")
     .option("--event <glob>", "Filter event by glob pattern")
     .option("--since <span>", "Filter by age: 30m, 2h, 1d")
+    .option("--clear-last <n>", "Delete the last N logs")
+    .option("--clear-id <id>", "Delete one log by log ID")
+    .option("--dry-run", "Preview delete effect without changing logs")
+    .option("--yes", "Confirm destructive clear operation")
+    .option("--json", "Output raw JSON log entries")
     .option("--clear", "Delete log file")
-    .action((cmdOpts: { limit: string; level?: string; event?: string; since?: string; clear?: boolean }) => {
+    .action((cmdOpts: {
+      limit: string;
+      all?: boolean;
+      level?: string;
+      event?: string;
+      since?: string;
+      clearLast?: string;
+      clearId?: string;
+      dryRun?: boolean;
+      yes?: boolean;
+      json?: boolean;
+      clear?: boolean;
+    }) => {
+      const clearModes = [cmdOpts.clear === true, Boolean(cmdOpts.clearLast), Boolean(cmdOpts.clearId)].filter(Boolean).length;
+      if (clearModes > 1) throw new Error("Use only one clear mode at a time: --clear, --clear-last, or --clear-id.");
+      if (clearModes > 0 && !cmdOpts.dryRun && cmdOpts.yes !== true) {
+        throw new Error("Destructive clear requires --yes. Use --dry-run to preview first.");
+      }
       if (cmdOpts.clear) {
+        if (cmdOpts.dryRun) {
+          const existing = existsSync(LOG_FILE);
+          const count = existing ? readJsonl(LOG_FILE, Number.MAX_SAFE_INTEGER).length : 0;
+          print({ dry_run: true, action: "clear", target: LOG_FILE, would_delete: count });
+          return;
+        }
         if (existsSync(LOG_FILE)) {
           writeFileSync(LOG_FILE, "", "utf-8");
           print({ deleted: [LOG_FILE], missing: [] });
@@ -2379,13 +2866,52 @@ async function main(): Promise<void> {
         }
         return;
       }
-      const limit = Math.max(1, Number.parseInt(cmdOpts.limit, 10) || 50);
-      const rows = readJsonl(LOG_FILE, limit * 10);
+      if (cmdOpts.clearLast) {
+        const removeCount = parsePositiveIntOption(cmdOpts.clearLast, "--clear-last");
+        const ensured = ensureLogIds(readJsonl(LOG_FILE, Number.MAX_SAFE_INTEGER));
+        const rows = ensured.rows;
+        if (ensured.updated) writeJsonlRows(LOG_FILE, rows);
+        if (removeCount > rows.length) {
+          throw new Error(`Cannot clear last ${removeCount} logs; only ${rows.length} logs exist.`);
+        }
+        if (cmdOpts.dryRun) {
+          const affected = rows.slice(rows.length - removeCount).map((row) => String(row.log_id ?? ""));
+          print({ dry_run: true, action: "clear_last", remove_count: removeCount, would_delete_ids: affected });
+          return;
+        }
+        const keep = rows.slice(0, rows.length - removeCount);
+        writeJsonlRows(LOG_FILE, keep);
+        print({ cleared: removeCount, remaining: keep.length });
+        return;
+      }
+      if (cmdOpts.clearId) {
+        const targetId = cmdOpts.clearId.trim();
+        if (!targetId) throw new Error("--clear-id requires a non-empty ID.");
+        const ensured = ensureLogIds(readJsonl(LOG_FILE, Number.MAX_SAFE_INTEGER));
+        const rows = ensured.rows;
+        if (ensured.updated) writeJsonlRows(LOG_FILE, rows);
+        const keep = rows.filter((row) => String(row.log_id ?? "").trim() !== targetId);
+        if (keep.length === rows.length) {
+          throw new Error(`No log found with log ID '${targetId}'.`);
+        }
+        if (cmdOpts.dryRun) {
+          print({ dry_run: true, action: "clear_id", would_delete_id: targetId, matches: rows.length - keep.length });
+          return;
+        }
+        writeJsonlRows(LOG_FILE, keep);
+        print({ cleared_id: targetId, remaining: keep.length });
+        return;
+      }
+      const limit = parsePositiveIntOption(cmdOpts.limit, "--limit", 50);
+      const rows = readJsonl(LOG_FILE, Number.MAX_SAFE_INTEGER);
+      const ensured = ensureLogIds(rows);
+      const normalizedRows = ensured.rows;
+      if (ensured.updated) writeJsonlRows(LOG_FILE, normalizedRows);
       const level = (cmdOpts.level ?? "").trim().toLowerCase();
       const eventGlob = (cmdOpts.event ?? "").trim();
       const sinceSeconds = parseSinceSeconds(cmdOpts.since ?? "");
       const cutoff = sinceSeconds !== null ? Date.now() / 1000 - sinceSeconds : null;
-      const filtered = rows.filter((row) => {
+      const filtered = normalizedRows.filter((row) => {
         if (level && String(row.level ?? "").toLowerCase() !== level) return false;
         if (eventGlob && !globMatch(String(row.event ?? ""), eventGlob)) return false;
         if (cutoff !== null) {
@@ -2394,8 +2920,27 @@ async function main(): Promise<void> {
         }
         return true;
       });
-      const output = filtered.length > limit ? filtered.slice(-limit) : filtered;
-      print({ path: LOG_FILE, entries: output });
+      const output = cmdOpts.all ? filtered : (filtered.length > limit ? filtered.slice(-limit) : filtered);
+      if (cmdOpts.json) {
+        print({ path: LOG_FILE, entries: output });
+        return;
+      }
+      if (!output.length) {
+        console.log("No log entries found.");
+        return;
+      }
+      const latest = output[output.length - 1];
+      const summary = [
+        `Showing ${output.length} logs`,
+        cmdOpts.all ? "mode=all" : `mode=latest-${limit}`,
+        level ? `level=${level}` : "",
+        eventGlob ? `event=${eventGlob}` : "",
+        cmdOpts.since ? `since=${cmdOpts.since}` : "",
+        `latest_event=${String(latest.event ?? "unknown")}`,
+        `latest_status=${String(latest.status ?? "unknown")}`
+      ].filter(Boolean).join(" | ");
+      const blocks = output.map((row, index) => formatLogEntry(row, index));
+      console.log(`${summary}\n\n${blocks.join("\n\n")}`);
     });
 
   program
@@ -2407,6 +2952,8 @@ async function main(): Promise<void> {
     .option("--since <span>", "Filter by age: 30m, 2h, 1d")
     .option("--clear-last <n>", "Delete the last N trades")
     .option("--clear-id <id>", "Delete one trade by history ID")
+    .option("--dry-run", "Preview delete effect without changing history")
+    .option("--yes", "Confirm destructive clear operation")
     .option("--json", "Output raw JSON history entries")
     .option("--clear", "Delete history file")
     .action(async (cmdOpts: {
@@ -2417,12 +2964,23 @@ async function main(): Promise<void> {
       since?: string;
       clearLast?: string;
       clearId?: string;
+      dryRun?: boolean;
+      yes?: boolean;
       json?: boolean;
       clear?: boolean;
     }) => {
       const clearModes = [cmdOpts.clear === true, Boolean(cmdOpts.clearLast), Boolean(cmdOpts.clearId)].filter(Boolean).length;
       if (clearModes > 1) throw new Error("Use only one clear mode at a time: --clear, --clear-last, or --clear-id.");
+      if (clearModes > 0 && !cmdOpts.dryRun && cmdOpts.yes !== true) {
+        throw new Error("Destructive clear requires --yes. Use --dry-run to preview first.");
+      }
       if (cmdOpts.clear) {
+        if (cmdOpts.dryRun) {
+          const existing = existsSync(BUY_HISTORY_FILE);
+          const count = existing ? readJsonl(BUY_HISTORY_FILE, Number.MAX_SAFE_INTEGER).length : 0;
+          print({ dry_run: true, action: "clear", target: BUY_HISTORY_FILE, would_delete: count });
+          return;
+        }
         if (existsSync(BUY_HISTORY_FILE)) {
           writeFileSync(BUY_HISTORY_FILE, "", "utf-8");
           print({ deleted: [BUY_HISTORY_FILE], missing: [] });
@@ -2432,15 +2990,17 @@ async function main(): Promise<void> {
         return;
       }
       if (cmdOpts.clearLast) {
-        const removeCount = Number.parseInt(cmdOpts.clearLast, 10);
-        if (!Number.isInteger(removeCount) || removeCount <= 0) {
-          throw new Error("--clear-last must be a positive integer.");
-        }
+        const removeCount = parsePositiveIntOption(cmdOpts.clearLast, "--clear-last");
         const ensured = ensureHistoryIds(readJsonl(BUY_HISTORY_FILE, Number.MAX_SAFE_INTEGER));
         const rows = ensured.rows;
         if (ensured.updated) writeJsonlRows(BUY_HISTORY_FILE, rows);
         if (removeCount > rows.length) {
           throw new Error(`Cannot clear last ${removeCount} trades; only ${rows.length} trades exist.`);
+        }
+        if (cmdOpts.dryRun) {
+          const affected = rows.slice(rows.length - removeCount).map((row) => String(row.history_id ?? ""));
+          print({ dry_run: true, action: "clear_last", remove_count: removeCount, would_delete_ids: affected });
+          return;
         }
         const keep = rows.slice(0, rows.length - removeCount);
         writeJsonlRows(BUY_HISTORY_FILE, keep);
@@ -2456,6 +3016,10 @@ async function main(): Promise<void> {
         const keep = rows.filter((row) => String(row.history_id ?? "").trim() !== targetId);
         if (keep.length === rows.length) {
           throw new Error(`No trade found with history ID '${targetId}'.`);
+        }
+        if (cmdOpts.dryRun) {
+          print({ dry_run: true, action: "clear_id", would_delete_id: targetId, matches: rows.length - keep.length });
+          return;
         }
         writeJsonlRows(BUY_HISTORY_FILE, keep);
         print({ cleared_id: targetId, remaining: keep.length });
@@ -2501,7 +3065,8 @@ async function main(): Promise<void> {
       console.log(blocks.join("\n\n"));
     });
 
-  await program.parseAsync(process.argv);
+  const normalizedArgv = process.argv.map((arg) => (arg === "-all" ? "--all" : arg));
+  await program.parseAsync(normalizedArgv);
 }
 
 main().catch((error: unknown) => {
